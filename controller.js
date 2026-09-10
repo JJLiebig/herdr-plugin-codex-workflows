@@ -21,7 +21,7 @@ const herdr = process.env.HERDR_BIN_PATH || "herdr", gitBin = process.env.GIT_BI
 const gh = process.env.GH_BIN_PATH || "gh";
 const CODE_ROOT = path.dirname(WORKTREE_ROOT);
 const launchSteps = ["Resolve repository", "Prepare request", "Create worktree", "Start agent"];
-const cleanupSteps = ["Check workspace", "Stop agent", "Archive session", "Check worktree", "Remove worktree"];
+const cleanupSteps = ["Check workspace", "Stop agent", "Finalize session", "Check worktree", "Remove worktree"];
 function readJson(value, fallback = null) {
   try {
     return JSON.parse(value);
@@ -41,8 +41,28 @@ function readPluginConfig(configDir = process.env.HERDR_PLUGIN_CONFIG_DIR) {
 function autoCleanupOnPrMerge(configDir = process.env.HERDR_PLUGIN_CONFIG_DIR) {
   return readPluginConfig(configDir)["auto-cleanup-on-pr-merge"] === true;
 }
+function installedIntegrations(run = runHerdr, warn = (message) => console.error(message)) {
+  try {
+    const installed = new Set();
+    let parsed = 0;
+    for (const line of String(run(["integration", "status"])).split(/\r?\n/)) {
+      const match = line.match(/^\s*([A-Za-z0-9_-]+):\s+(.+)$/);
+      if (!match) continue;
+      parsed += 1;
+      if (!/^not installed\b/i.test(match[2])) installed.add(match[1].toLowerCase());
+    }
+    if (!parsed) {
+      warn("could not read `herdr integration status`; offering every harness");
+      return null;
+    }
+    return installed;
+  } catch (error) {
+    warn(`could not read \`herdr integration status\` (${error.message}); offering every harness`);
+    return null;
+  }
+}
 function configuredHarnesses(config = readPluginConfig()) {
-  return harnessList(config.harnesses || {});
+  return harnessList(config.harnesses || {}, installedIntegrations());
 }
 function defaultHarnessKind(config = readPluginConfig()) {
   return normalizeHarness(config["default-harness"]) || DEFAULT_HARNESS;
@@ -523,7 +543,9 @@ function cleanupOps(workspaceId, abandon, harness = getHarness(DEFAULT_HARNESS))
     git: async (cwd, args) => git(cwd, args),
     pullRequest: async (repo, number) => readJson(execute(gh, ["pr", "view", String(number), "--repo", repo, "--json", "state,mergedAt"])),
     release: (workspaceId, paneId, sessionId, worktreePath) => releaseOwnedAgent(workspaceId, paneId, sessionId, worktreePath, harness),
-    archive: async (sessionId) => runHarness(harness, harness.archiveArgs(sessionId)),
+    archive: async (sessionId) => {
+      if (harness.archiveArgs) runHarness(harness, harness.archiveArgs(sessionId));
+    },
     remove: async (workspaceId) => runHerdr(["worktree", "remove", "--workspace", workspaceId]),
     cleanup: async () => (await cleanupCurrentWorkflow(workspaceId)).result,
     project: async (state) => projectCleanup(workspaceId, state),
@@ -768,6 +790,10 @@ function controllerProtocol(runtime, lifecycle, resolveHello, resolveInput, reso
         if (message.harness) {
           harness = getHarness(message.harness);
           if (!harness) throw new Error(`unsupported harness: ${message.harness}`);
+          if (Array.isArray(runtime.harnesses) && runtime.harnesses.length
+            && !runtime.harnesses.some((entry) => entry.kind === harness.kind)) {
+            throw new Error(`harness is not available: ${message.harness}`);
+          }
         } else {
           harness = runtime.harness || getHarness(DEFAULT_HARNESS);
         }
@@ -827,6 +853,10 @@ async function controller(mode = "github") {
   const server = await createPipeServer(pipeName, controllerProtocol(runtime, lifecycle, resolveHello, resolveInput, resolveProgress));
 
   try {
+    if (!runtime.harnesses.length) {
+      notify("No agent harness installed", "Install a Herdr integration such as codex or opencode with `herdr integration install <name>`.");
+      return;
+    }
     openInputPopup(pipeName, mode);
     await Promise.race([helloPromise, delay(30000).then(() => { throw new Error("input popup did not connect to its controller"); })]);
     const submission = await inputPromise;
@@ -1060,18 +1090,39 @@ function popupInputKey(state, sequence, key) {
     if (multiline && (key.shift || sequence === "\x1b[13;2u")) { state.values[textFieldIndex(active)] += "\n"; return "render"; }
     return state.values[0].trim() ? "submit" : null;
   }
-  if (key.name === "tab") { cycle(key.shift ? -1 : 1); return "render"; }
-  if (active === "harness" || active === "model") {
+  if (key.name === "tab") { state.typeahead = null; cycle(key.shift ? -1 : 1); return "render"; }
+  if (active === "harness") {
+    const select = (index) => {
+      state.harnessIndex = index;
+      const next = state.harnesses[index];
+      state.modelIndex = Math.max(0, (next.models || []).indexOf(next.defaultModel));
+    };
+    const back = ["up", "left"].includes(key.name), forward = ["down", "right"].includes(key.name);
+    if (back || forward) {
+      state.typeahead = null;
+      const step = forward ? 1 : -1;
+      select((state.harnessIndex + step + state.harnesses.length) % state.harnesses.length);
+      return "render";
+    }
+    if (sequence && /^[A-Za-z0-9]$/.test(sequence) && !key.ctrl && !key.meta) {
+      const needle = sequence.toLowerCase();
+      const start = state.typeahead === needle ? 1 : 0;
+      for (let step = start; step < state.harnesses.length; step += 1) {
+        const index = (state.harnessIndex + step) % state.harnesses.length;
+        if (!state.harnesses[index].label.toLowerCase().startsWith(needle)) continue;
+        if (step) select(index);
+        state.typeahead = needle;
+        return "render";
+      }
+      state.typeahead = null;
+    }
+    return null;
+  }
+  if (active === "model") {
     const harness = state.harnesses[state.harnessIndex];
     const back = ["up", "left"].includes(key.name), forward = ["down", "right"].includes(key.name);
     if (!back && !forward) return null;
-    if (active === "harness") {
-      state.harnessIndex = (state.harnessIndex + (forward ? 1 : -1) + state.harnesses.length) % state.harnesses.length;
-      const next = state.harnesses[state.harnessIndex];
-      state.modelIndex = Math.max(0, (next.models || []).indexOf(next.defaultModel));
-    } else {
-      state.modelIndex = (state.modelIndex + (forward ? 1 : -1) + harness.models.length) % harness.models.length;
-    }
+    state.modelIndex = (state.modelIndex + (forward ? 1 : -1) + harness.models.length) % harness.models.length;
     return "render";
   }
   if (key.name === "backspace") state.values[textFieldIndex(active)] = [...state.values[textFieldIndex(active)]].slice(0, -1).join("");
@@ -1085,8 +1136,13 @@ function popupSelection(state) {
   return { kind: harness.kind, label: harness.label, model: harness.models.length ? harness.models[state.modelIndex] || harness.defaultModel : "" };
 }
 
+function popupHarnesses(harnesses) {
+  return Array.isArray(harnesses) ? harnesses : harnessList();
+}
+
 function popupState(mode, harnesses, defaultHarness) {
-  const list = Array.isArray(harnesses) && harnesses.length ? harnesses : harnessList();
+  const list = popupHarnesses(harnesses);
+  if (!list.length) throw new Error("No agent harness is installed; run `herdr integration install <name>`.");
   const harnessIndex = Math.max(0, list.findIndex((harness) => harness.kind === defaultHarness));
   const state = { mode, harnesses: list, harnessIndex, modelIndex: 0, active: 0, values: ["", ""] };
   state.modelIndex = Math.max(0, (list[harnessIndex].models || []).indexOf(list[harnessIndex].defaultModel));
@@ -1095,10 +1151,10 @@ function popupState(mode, harnesses, defaultHarness) {
 }
 
 async function readPopupInput(mode = "github", harnesses, defaultHarness = defaultHarnessKind()) {
-  const selection = harnessList();
+  const list = popupHarnesses(harnesses);
+  const fallback = list.find((harness) => harness.kind === defaultHarness) || list[0];
+  if (!fallback) throw new Error("No agent harness is installed; run `herdr integration install <name>`.");
   if (!input.isTTY || typeof input.setRawMode !== "function") {
-    const fallback = (Array.isArray(harnesses) && harnesses.length ? harnesses : selection)
-      .find((harness) => harness.kind === defaultHarness) || selection[0];
     const model = fallback.models.length ? fallback.defaultModel || fallback.models[0] : "";
     const rl = readlinePromises.createInterface({ input, output });
     if (mode === "task") {
@@ -1111,7 +1167,7 @@ async function readPopupInput(mode = "github", harnesses, defaultHarness = defau
     rl.close();
     return target ? { target, instructions, harness: fallback.kind, model } : null;
   }
-  const state = popupState(mode, harnesses, defaultHarness);
+  const state = popupState(mode, list, defaultHarness);
   output.write(`\x1b[>1u${popupInputView(state)}`);
   readline.emitKeypressEvents(input);
   input.setRawMode(true);
@@ -1149,7 +1205,8 @@ async function runCleanup(context, progress) {
   }
   const { result, worktree, branch, abandon, harness } = cleanup;
   const label = harness?.label || "Codex";
-  if (result.status === "removed") return notify(`${label} workflow cleaned up`, `Archived its ${label} session and removed ${worktree.checkout_path}; branch ${branch} remains.`, "done");
+  const archived = harness?.archiveArgs ? `Archived its ${label} session and removed` : "Removed";
+  if (result.status === "removed") return notify(`${label} workflow cleaned up`, `${archived} ${worktree.checkout_path}; branch ${branch} remains.`, "done");
   if (result.status === "missing") return;
   if (result.status === "busy") {
     notify(`${label} workflow cleanup stopped`, result.reason);
@@ -1219,7 +1276,7 @@ async function main() {
 }
 
 module.exports = { autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, configuredHarnesses, controllerProtocol, defaultHarnessKind,
-  harnessStartArgs, openInputPopup, openProgressPane,
+  harnessStartArgs, installedIntegrations, openInputPopup, openProgressPane,
   popupFields, popupInputKey, popupInputView, popupSelection, popupState,
   project,
   implementationPullRequest, isAgentPromptStalled, monitor, progressView, readPluginConfig, resolveRepository, sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands,

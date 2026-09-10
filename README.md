@@ -2,22 +2,42 @@
 
 Windows-only Herdr actions for turning a feature request or issue into an open
 pull request, or understanding an existing pull request in an isolated agent
-workspace. Codex and opencode are supported today; the plugin is built around
-per-harness adapters so more Herdr agent kinds can be added.
+workspace. Supports every Herdr agent kind that reports a stable session, and
+is built around per-harness adapters so new kinds are a one-line addition.
 
 ## Harnesses
 
 Pick the harness in the workflow popup. The first field is a selector:
-`Harness: < Codex >`. Use Up/Down or Left/Right to change it, then Tab to the
-next field. Harnesses that expose selectable models show a second
-`Model: < ... >` selector.
+`Harness: < Codex >`. Use Up/Down or Left/Right to change it, type the first
+letter of a harness to jump to it, then Tab to the next field. Harnesses that
+expose selectable models show a second `Model: < ... >` selector. Only harnesses
+whose Herdr integration is installed are offered.
 
-Shipped adapters:
-
-| Harness | Kind | Session archive | Notes |
+| Kind | Label | Session archive | Notes |
 | --- | --- | --- | --- |
-| Codex | `codex` | `codex archive <id>` | Forwards `--auto-account` when the executable advertises it |
-| opencode | `opencode` | `opencode session delete <id>` | Defaults to `opencode-go/deepseek-flash` |
+| `codex` | Codex | `codex archive <id>` | Forwards `--auto-account` when the executable advertises it |
+| `opencode` | opencode | `opencode session delete <id>` | Models: `opencode-go/deepseek-flash`, `opencode-go/glm-5.3-flash` |
+| `claude` | Claude | none, session retained | |
+| `cursor` | Cursor | none, session retained | |
+| `copilot` | Copilot | none, session retained | |
+| `devin` | Devin | none, session retained | |
+| `droid` | Droid | none, session retained | |
+| `kimi` | Kimi | none, session retained | |
+| `kilo` | Kilo | none, session retained | |
+| `mastracode` | Mastracode | none, session retained | |
+| `pi` | Pi | none, session retained | Path or id session |
+| `omp` | OMP | none, session retained | Path or id session |
+| `qwen` | Qwen | none, session retained | |
+| `qodercli` | Qoder | none, session retained | |
+| `grok` | Grok | none, session retained | |
+| `hermes` | Hermes | none, session retained | |
+| `agy` | Antigravity | none, session retained | Integration installs as `antigravity-cli` |
+
+For kinds without an archive command, cleanup still stops the agent and removes
+the worktree; the agent's own session data is left on disk. Kinds that Herdr
+does not give a stable session (for example `gemini`, `cline`, `kiro`, `amp`,
+and `maki`) are not offered, because cleanup could not verify workspace
+ownership.
 
 The default harness and per-harness models come from the plugin config
 directory (see below).
@@ -36,10 +56,12 @@ herdr plugin link .\herdr-plugin-codex-workflows
 ```
 
 Requires Windows, Node.js 18+, Git, GitHub CLI authentication, and Herdr 0.8.2+.
-For Codex, use Codex CLI 0.151.0-fork.1 or a compatible later version with the
-Ponytail and Review Suite Codex plugins (Ask Pro optional). For opencode, install
-the `opencode` CLI and the Herdr opencode integration (`herdr integration install
-opencode`).
+Install the CLI and Herdr integration for the harnesses you want to use
+(`herdr integration install <name>`); the picker only offers installed ones. For
+Codex, use Codex CLI 0.151.0-fork.1 or a compatible later version with the
+Ponytail and Review Suite Codex plugins (Ask Pro optional). Codex is the only
+harness that runs the Codex-specific skills; other harnesses use a neutral
+prompt.
 
 ## Hotkeys
 
@@ -142,27 +164,30 @@ models are only offered for harnesses that support selecting one.
 When enabled, a detached watcher waits for an unambiguous merge, then invokes
 the same current-workflow cleanup used by `Alt+Shift+D`. An open or closed,
 unmerged pull request keeps the agent and workspace intact. Cleanup waits for
-the exact owning agent to settle, quits it, runs the harness archive step, then
-rechecks the local identity and cleanliness and asks Herdr to remove the
-workspace and worktree without force. The workflow branch remains. The archive
-step is harness-specific: `codex archive <id>` for Codex and
-`opencode session delete <id>` for opencode, which removes that session.
+the exact owning agent to settle, quits it, runs the harness session-finalize
+step, then rechecks the local identity and cleanliness and asks Herdr to remove
+the workspace and worktree without force. The workflow branch remains. The
+finalize step is harness-specific: `codex archive <id>` for Codex and
+`opencode session delete <id>` for opencode (which removes that session), and a
+no-op for harnesses that have no archive command, leaving their session data on
+disk.
 Workflow branches use the `auto-` prefix (for example `auto-issue-3611-a1b2c3`);
 legacy `codex/` branches remain valid for cleanup. The agent is asked to exit
-with the harness quit command (`/quit` for Codex, `/exit` for opencode).
+with the harness quit command (`/quit` for Codex, `/exit` for opencode, or
+Ctrl+C for the others).
 
 Failure and cancellation keep all workflow state. The
-`cleanup-current-workflow` action uses the same archive-first transaction
+`cleanup-current-workflow` action uses the same finalize-first transaction
 without waiting for a merge. Manual cleanup opens the same slim bottom progress
-pane as dispatch, showing workspace checks, agent shutdown, session archiving,
+pane as dispatch, showing workspace checks, agent shutdown, session finalize,
 and worktree removal. Failures stay visible; focus the pane and press Enter,
 Escape, or Ctrl+C to close it. Successful removal closes the workspace and its
 progress pane. Closing the progress pane does not cancel cleanup.
 For an idle or waiting active workflow, it first
 cancels the controller. It refuses a changed identity, dirty worktree, working
 or changed agent, path outside
-`C:\Code\.worktrees`, or an ambiguous agent session. An archive failure removes
-nothing; a failure after archive keeps the worktree for manual inspection.
+`C:\Code\.worktrees`, or an ambiguous agent session. A finalize failure removes
+nothing; a failure after finalize keeps the worktree for manual inspection.
 
 A Herdr or machine restart loses an active watcher. The plugin has no registry
 or startup recovery and does not reconstruct the wait after restart. Use the

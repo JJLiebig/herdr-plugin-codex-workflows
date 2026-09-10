@@ -7,7 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {
-  autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, controllerProtocol, harnessStartArgs, openInputPopup,
+  autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, controllerProtocol, harnessStartArgs, installedIntegrations, openInputPopup,
   project,
   implementationPullRequest, isAgentPromptStalled, monitor, openProgressPane, popupFields, popupInputKey, popupInputView, popupSelection, popupState, progressView, resolveRepository,
   sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands, waitForActivity,
@@ -153,12 +153,16 @@ test("popup selects a harness and its model with the arrow keys", () => {
   assert.equal(popupFields(state)[0], "harness");
   assert.equal(popupSelection(state).kind, "codex");
   state.active = 0;
+  assert.equal(popupInputKey(state, "o", { name: "o", sequence: "o" }), "render");
+  assert.equal(popupSelection(state).kind, "opencode");
+  popupInputKey(state, undefined, { name: "down" });
+  assert.equal(popupSelection(state).kind, "claude");
+  assert.equal(popupFields(state).includes("model"), false);
   popupInputKey(state, undefined, { name: "up" });
   assert.equal(popupSelection(state).kind, "opencode");
-  popupInputKey(state, undefined, { name: "up" });
+  assert.equal(popupInputKey(state, undefined, { name: "up" }), "render");
   assert.equal(popupSelection(state).kind, "codex");
   popupInputKey(state, undefined, { name: "down" });
-  assert.equal(popupSelection(state).kind, "opencode");
   const fields = popupFields(state);
   assert.equal(fields.includes("model"), true);
   assert.equal(popupSelection(state).model, "opencode-go/deepseek-flash");
@@ -169,6 +173,44 @@ test("popup selects a harness and its model with the arrow keys", () => {
   assert.equal(popupSelection(state).model, "opencode-go/deepseek-flash");
   assert.match(popupInputView(state, 60), /Harness: < opencode >/);
   assert.match(popupInputView(state, 60), /Model:   < opencode-go\/deepseek-flash >/);
+
+  const repeat = popupState("github", harnessList(), "codex");
+  repeat.active = 0;
+  popupInputKey(repeat, "c", { name: "c", sequence: "c" });
+  assert.equal(popupSelection(repeat).kind, "codex");
+  popupInputKey(repeat, "c", { name: "c", sequence: "c" });
+  assert.equal(popupSelection(repeat).kind, "claude");
+  popupInputKey(repeat, "c", { name: "c", sequence: "c" });
+  assert.equal(popupSelection(repeat).kind, "cursor");
+});
+
+test("parses installed integrations from Herdr status output", () => {
+  const output = "pi: not installed (C:\\x)\ncodex: current (v8) (C:\\y)\nantigravity-cli: outdated (C:\\z)\n";
+  const quiet = () => {};
+  assert.deepEqual([...installedIntegrations(() => output, quiet)].sort(), ["antigravity-cli", "codex"]);
+  assert.deepEqual([...installedIntegrations(() => "  qodercli: current (v1) (p)\n", quiet)], ["qodercli"]);
+  assert.deepEqual([...installedIntegrations(() => "  herdr_opencode: current (v1) (p)\n", quiet)], ["herdr_opencode"]);
+  assert.equal(installedIntegrations(() => { throw new Error("offline"); }, quiet), null);
+  assert.equal(installedIntegrations(() => "unrecognized output", quiet), null);
+});
+
+test("popup refuses to open when no harness integration is available", () => {
+  assert.throws(() => popupState("github", [], "codex"), /No agent harness is installed/);
+});
+
+test("harness list filters by installed integrations and defaults to generic cleanup", () => {
+  assert.deepEqual(harnessList({}, new Set(["codex", "opencode"])).map((harness) => harness.kind), ["codex", "opencode"]);
+  assert.deepEqual(harnessList().map((harness) => harness.kind).slice(0, 3), ["codex", "opencode", "claude"]);
+  const claude = getHarness("claude");
+  assert.equal(claude.archiveArgs, null);
+  assert.equal(claude.supportsModel, false);
+  assert.deepEqual(claude.quit, { keys: ["ctrl+c", "ctrl+c"] });
+  assert.equal(sessionMatches(claude, { source: "herdr:claude", kind: "id", value: "abc-123" }), true);
+  assert.equal(sessionMatches(claude, { source: "herdr:codex", kind: "id", value: "abc-123" }), false);
+  const omp = getHarness("omp");
+  assert.equal(sessionMatches(omp, { source: "herdr:omp", kind: "path", value: "C:\\sessions\\omp.jsonl" }), true);
+  assert.equal(getHarness("agy").integration, "antigravity-cli");
+  assert.equal(getHarness("qodercli").integration, "qodercli");
 });
 
 test("opencode and codex expose different session identity and resume semantics", () => {
@@ -191,8 +233,8 @@ test("opencode and codex expose different session identity and resume semantics"
 });
 
 test("rejects an unsupported harness or an unoffered model", async () => {
-  const attempt = async (message) => {
-    const runtime = { workflow: "issue", launch: {}, harness: getHarness("codex"), harnesses: harnessList() };
+  const attempt = async (message, harnesses = harnessList()) => {
+    const runtime = { workflow: "issue", launch: {}, harness: getHarness("codex"), harnesses };
     const connection = {};
     const protocol = controllerProtocol(runtime, new Lifecycle(), () => {}, () => {});
     await protocol.message({ type: "hello", role: "input" }, connection);
@@ -201,6 +243,7 @@ test("rejects an unsupported harness or an unoffered model", async () => {
   await assert.rejects(attempt({ harness: "nope", model: "" }), /unsupported harness/);
   await assert.rejects(attempt({ harness: "opencode", model: "opencode-go/not-real" }), /unsupported opencode model/);
   await assert.rejects(attempt({ harness: "codex", model: "gpt-5" }), /unsupported Codex model/);
+  await assert.rejects(attempt({ harness: "opencode", model: "" }, harnessList({}, new Set(["codex"]))), /harness is not available/);
 });
 
 test("harness config overrides the offered model list", () => {
