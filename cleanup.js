@@ -262,7 +262,8 @@ async function watch(payload, ops, interval = 60000) {
       await ops.delay(interval);
     }
   }
-  const label = (getHarness(payload.harness) || getHarness(DEFAULT_HARNESS)).label;
+  const harness = getHarness(payload.harness) || getHarness(DEFAULT_HARNESS);
+  const label = harness.label;
   try {
     if (!await preflight(payload, ops, true)) return "superseded";
   } catch (error) {
@@ -285,7 +286,11 @@ async function watch(payload, ops, interval = 60000) {
     if (result.status === "busy") { await ops.delay(interval); continue; }
     if (result.status === "retry") { await ops.delay(interval); continue; }
     if (result.status === "missing") return "superseded";
-    if (result.status === "removed") { await ops.notify(`${label} workflow cleaned up`, `Archived its ${label} session and removed the worktree; branch ${payload.branch} remains.`); return "removed"; }
+    if (result.status === "removed") {
+      const archived = harness.archiveArgs ? `Archived its ${label} session and removed` : "Removed";
+      await ops.notify(`${label} workflow cleaned up`, `${archived} the worktree; branch ${payload.branch} remains.`);
+      return "removed";
+    }
     await ops.project(result.status);
     await ops.notify(result.status === "partial" ? `${label} workflow partially cleaned up` : `${label} workflow cleanup stopped`, result.reason);
     return result.status;
