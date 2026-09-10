@@ -9,7 +9,7 @@ const {
   associatedPr, cleanupTransaction, decodePayload, handoffWatcher, manualWorkspace, matchingOwnedSession, matchingSession, watch, withCleanupClaim,
   readWorkflowIdentity, writeWorkflowIdentity, recoveredWorkspace,
 } = require("./cleanup.js");
-const { DEFAULT_HARNESS, getHarness, harnessList, modelValid, normalizeHarness } = require("./harnesses.js");
+const { DEFAULT_HARNESS, getHarness, harnessList, normalizeHarness } = require("./harnesses.js");
 const {
   Lifecycle, WORKTREE_ROOT, collisionReason, connectPipe, createPipeServer, makeIdentity,
   makePipeName, parseGitHubRemote, parseTarget, parseWorktreeList,
@@ -41,6 +41,29 @@ function readPluginConfig(configDir = process.env.HERDR_PLUGIN_CONFIG_DIR) {
 function autoCleanupOnPrMerge(configDir = process.env.HERDR_PLUGIN_CONFIG_DIR) {
   return readPluginConfig(configDir)["auto-cleanup-on-pr-merge"] === true;
 }
+function readPluginState(configDir = process.env.HERDR_PLUGIN_CONFIG_DIR) {
+  if (!configDir) return {};
+  try {
+    const value = readJson(fs.readFileSync(path.join(configDir, "state.json"), "utf8"), {});
+    return value && typeof value === "object" ? value : {};
+  } catch {
+    return {};
+  }
+}
+function writePluginState(patch, configDir = process.env.HERDR_PLUGIN_CONFIG_DIR) {
+  if (!configDir) return;
+  const target = path.join(configDir, "state.json");
+  const temporary = `${target}.${crypto.randomUUID()}.tmp`;
+  try {
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(temporary, JSON.stringify({ ...readPluginState(configDir), ...patch }));
+    fs.renameSync(temporary, target);
+  } catch {
+    // Remembering the last harness is best effort.
+  } finally {
+    try { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); } catch { /* best effort */ }
+  }
+}
 function installedIntegrations(run = runHerdr, warn = (message) => console.error(message)) {
   try {
     const installed = new Set();
@@ -61,11 +84,13 @@ function installedIntegrations(run = runHerdr, warn = (message) => console.error
     return null;
   }
 }
-function configuredHarnesses(config = readPluginConfig()) {
-  return harnessList(config.harnesses || {}, installedIntegrations());
+function configuredHarnesses() {
+  return harnessList(installedIntegrations());
 }
-function defaultHarnessKind(config = readPluginConfig()) {
-  return normalizeHarness(config["default-harness"]) || DEFAULT_HARNESS;
+function defaultHarnessKind(configDir = process.env.HERDR_PLUGIN_CONFIG_DIR) {
+  return normalizeHarness(readPluginState(configDir)["last-harness"])
+    || normalizeHarness(readPluginConfig(configDir)["default-harness"])
+    || DEFAULT_HARNESS;
 }
 function execute(command, args) {
   const result = spawnSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true, maxBuffer: 16 * 1024 * 1024 });
@@ -123,14 +148,14 @@ function advertisesAutoAccount(readHelp = () => runCanonicalCodex(["--help"])) {
   }
 }
 
-function harnessStartArgs(harness, agentName, paneId, model = "", readHelp) {
-  const options = { model };
+function harnessStartArgs(harness, agentName, paneId, readHelp) {
+  const options = {};
   if (harness.supportsAutoAccount) options.autoAccount = advertisesAutoAccount(readHelp);
   return harness.startArgs(agentName, paneId, options);
 }
 
 function codexAgentStartArgs(agentName, paneId, readHelp) {
-  return harnessStartArgs(getHarness("codex"), agentName, paneId, "", readHelp);
+  return harnessStartArgs(getHarness("codex"), agentName, paneId, readHelp);
 }
 
 function isAgentPromptStalled(stderr) {
@@ -298,7 +323,6 @@ function saveWorkflowIdentity(runtime) {
   writeWorkflowIdentity(git(runtime.worktree.path, ["rev-parse", "--absolute-git-dir"]), {
     workflow_kind: runtime.workflow,
     workflow_harness: harnessKind(runtime),
-    workflow_model: runtime.model || "",
     workflow_branch: runtime.identity.branch,
     workflow_root_pane: runtime.worktree.root_pane.pane_id,
     workflow_session: runtime.ownerSessionId,
@@ -343,12 +367,7 @@ function harnessKind(runtime) {
   return runtime.harness?.kind || DEFAULT_HARNESS;
 }
 
-function modelOffered(runtime, harness, model) {
-  if (!model) return true;
-  if (!harness.supportsModel) return false;
-  const offered = (runtime.harnesses || []).find((entry) => entry.kind === harness.kind);
-  return offered ? offered.models.includes(model) : modelValid(model);
-}
+
 
 function project(runtime, state = "working", reason = "", operations = {}) {
   const phase = state === "waiting" ? "waiting" : "working";
@@ -374,7 +393,6 @@ function project(runtime, state = "working", reason = "", operations = {}) {
       "--token", "workflow_controller=active",
       "--token", `workflow_branch=${runtime.identity.branch}`,
       "--token", `workflow_controller_pipe=${runtime.controllerPipe}`,
-      ...(runtime.model ? ["--token", `workflow_model=${runtime.model}`] : []),
       ...(runtime.ownerSessionId ? ["--token", `workflow_root_pane=${paneId}`, "--token", `workflow_session=${runtime.ownerSessionId}`] : []),
     ]);
     report([
@@ -405,7 +423,6 @@ function projectTerminal(runtime, report, candidate = getAgent(runtime.identity.
       "--token", `workflow_state=${report.status}`,
       "--token", `workflow_controller=${report.status === "complete" ? "active" : "inactive"}`,
       "--token", `workflow_phase=${resultText}`,
-      ...(runtime.model ? ["--token", `workflow_model=${runtime.model}`] : []),
       ...(runtime.ownerSessionId ? ["--token", `workflow_root_pane=${paneId}`, "--token", `workflow_session=${runtime.ownerSessionId}`] : []),
     ]);
     runHerdr(["pane", "rename", paneId, `${runtime.identity.shortLabel} ${harnessLabel(runtime)} parent`]);
@@ -438,38 +455,64 @@ async function waitForShell(paneId, cwd) {
   throw new Error(`root pane ${paneId} did not reach an available shell`);
 }
 
+function promptOnce(agentName, prompt, onChild) {
+  return new Promise((resolve) => {
+    const child = spawn(herdr, ["agent", "prompt", agentName, prompt, "--wait", "--until", "working", "--until", "blocked"], {
+      stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+    });
+    onChild(child);
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", (error) => resolve({ error }));
+    child.once("close", (code) => {
+      if (code === 0) return resolve({ ok: true });
+      if (isAgentPromptStalled(stderr)) return resolve({ stalled: true });
+      resolve({ error: new Error(compact(stderr) || `agent prompt exited ${code}`) });
+    });
+  });
+}
+
 async function startParent(runtime, prompt) {
   const paneId = runtime.worktree.root_pane.pane_id;
+  const agentName = runtime.identity.agentName;
   await waitForShell(paneId);
-  runHerdr(harnessStartArgs(runtime.harness, runtime.identity.agentName, paneId, runtime.model));
-  const child = spawn(herdr, ["agent", "prompt", runtime.identity.agentName, prompt, "--wait"], {
-    stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
-  });
-  runtime.prompt = { child, finished: false, error: null };
-  let stderr = "";
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
-  child.once("error", (error) => { runtime.prompt.error = error; });
-  child.once("close", (code) => {
-    if (code !== 0 && isAgentPromptStalled(stderr)) {
-      try {
-        const agent = getAgent(runtime.identity.agentName);
-        const recovery = stalledPromptRecovery(agent?.agent_status);
-        if (recovery === "submit") {
-          for (const args of stalledPromptRecoveryCommands(runtime.identity.agentName)) runHerdr(args);
+  runHerdr(harnessStartArgs(runtime.harness, agentName, paneId));
+  runtime.prompt = { child: null, finished: false, error: null };
+  // Give a freshly detected agent time to finish bringing up its integrations.
+  await delay(1000);
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (runtime.prompt.error) break;
+    const result = await promptOnce(agentName, prompt, (child) => { runtime.prompt.child = child; });
+    runtime.prompt.child = null;
+    if (result.ok) { runtime.prompt.finished = true; return; }
+    if (result.error) { runtime.prompt.error = result.error; runtime.prompt.finished = true; return; }
+    try {
+      const recovery = stalledPromptRecovery(getAgent(agentName)?.agent_status);
+      if (recovery === "started") { runtime.prompt.finished = true; return; }
+      if (recovery === "submit") {
+        // The composer may hold the prompt; try to submit it and re-check before re-delivering.
+        try { for (const args of stalledPromptRecoveryCommands(agentName)) runHerdr(args); } catch { /* the wait timed out */ }
+        const settled = stalledPromptRecovery(getAgent(agentName)?.agent_status);
+        if (settled === "started") { runtime.prompt.finished = true; return; }
+        if (settled === "failed") {
+          runtime.prompt.error = new Error(`${runtime.harness.label} did not report a usable state after the prompt`);
+          runtime.prompt.finished = true;
+          return;
         }
-        else if (recovery === "failed") {
-          throw new Error(compact(stderr) || "agent prompt stalled outside a recoverable state");
-        }
-      } catch (error) {
-        runtime.prompt.error = error;
+      } else {
+        // Unknown state: re-delivering could submit the prompt twice.
+        runtime.prompt.error = new Error(`${runtime.harness.label} did not report a usable state after the prompt`);
+        runtime.prompt.finished = true;
+        return;
       }
-      runtime.prompt.finished = true;
-      return;
+    } catch {
+      // The agent could not be inspected; let the next attempt surface the failure.
     }
-    runtime.prompt.finished = true;
-    if (code !== 0) runtime.prompt.error = new Error(compact(stderr) || `agent prompt exited ${code}`);
-  });
+    if (attempt < 3) await delay(1000);
+  }
+  runtime.prompt.error = new Error(`${runtime.harness.label} did not accept the workflow prompt`);
+  runtime.prompt.finished = true;
 }
 
 async function stopParent(runtime) {
@@ -797,14 +840,10 @@ function controllerProtocol(runtime, lifecycle, resolveHello, resolveInput, reso
         } else {
           harness = runtime.harness || getHarness(DEFAULT_HARNESS);
         }
-        const offered = (runtime.harnesses || []).find((entry) => entry.kind === harness.kind);
-        const defaultModel = offered ? offered.defaultModel : harness.defaultModel;
-        const model = message.model === undefined ? defaultModel : String(message.model || "");
-        if (message.type === "input" && !modelOffered(runtime, harness, model)) throw new Error(`unsupported ${harness.label} model: ${model}`);
         lifecycle.transition(message.type === "input" ? "submit" : "cancel");
         resolveInput(message.type === "input" ? (runtime.workflow === "task"
-          ? { request: preserveLines(message.request), harness: harness.kind, model }
-          : { target: compact(message.target), instructions: preserveLines(message.instructions), harness: harness.kind, model }) : null);
+          ? { request: preserveLines(message.request), harness: harness.kind }
+          : { target: compact(message.target), instructions: preserveLines(message.instructions), harness: harness.kind }) : null);
         return {};
       }
       if (connection.role === "progress" && message?.type === "status") return { launch: { ...runtime.launch } };
@@ -847,7 +886,7 @@ async function controller(mode = "github") {
   const runtime = {
     workflow: mode === "task" ? "task" : null, lifecycle, terminal: null,
     controllerPipe: pipeName, cleanupRequest: null, harnesses: configuredHarnesses(),
-    harness: getHarness(defaultHarnessKind()), model: "",
+    harness: getHarness(defaultHarnessKind()),
     launch: { status: "collecting", step: 0, repo: repository.repo, repositorySource: "current" },
   };
   const server = await createPipeServer(pipeName, controllerProtocol(runtime, lifecycle, resolveHello, resolveInput, resolveProgress));
@@ -862,8 +901,7 @@ async function controller(mode = "github") {
     const submission = await inputPromise;
     if (submission === null) return;
     runtime.harness = getHarness(submission.harness) || runtime.harness;
-    runtime.model = submission.model ?? runtime.harness.defaultModel;
-    if (runtime.model && !modelValid(runtime.model)) throw new Error(`unsupported ${runtime.harness.label} model: ${runtime.model}`);
+    writePluginState({ "last-harness": runtime.harness.kind });
     runtime.launch.harness = runtime.harness.label;
     runtime.launch.status = "running";
     let target;
@@ -1008,57 +1046,91 @@ async function progress() {
 }
 
 function popupFields(state) {
-  const harness = state.harnesses[state.harnessIndex];
-  const fields = ["harness"];
-  if (harness?.models?.length) fields.push("model");
-  if (state.mode === "task") fields.push("request");
-  else fields.push("target", "instructions");
-  return fields;
+  return state.mode === "task" ? ["harness", "request"] : ["harness", "target", "instructions"];
 }
 
 function textFieldIndex(field) {
   return field === "instructions" ? 1 : 0;
 }
 
-function wrapPopupText(value, width) {
-  return String(value || "").split("\n").flatMap((line) => {
-    const chars = [...line], lines = [];
-    do lines.push(chars.splice(0, width).join("")); while (chars.length);
-    return lines;
-  });
+function visualLines(value, width) {
+  const lines = [];
+  let offset = 0;
+  for (const logical of String(value || "").split("\n")) {
+    const chars = [...logical];
+    let index = 0;
+    do {
+      const slice = chars.slice(index, index + width);
+      lines.push({ start: offset + index, end: offset + index + slice.length, text: slice.join("") });
+      index += width;
+    } while (index < chars.length);
+    offset += chars.length + 1;
+  }
+  return lines;
+}
+
+function visualRow(lines, cursor) {
+  let row = 0;
+  for (let index = 1; index < lines.length; index += 1) {
+    if (lines[index].start > cursor) break;
+    row = index;
+  }
+  return row;
 }
 
 function popupInputView(state, width = output.columns || 80, height = output.rows || 10) {
+  state.width = width;
   const fields = popupFields(state);
-  const harness = state.harnesses[state.harnessIndex] || { label: "Codex", models: [], defaultModel: "" };
+  const harness = state.harnesses[state.harnessIndex] || { label: "Codex" };
   const active = fields[state.active];
   const marker = (field) => (field === active ? ">" : " ");
-  const model = harness.models[state.modelIndex] || harness.defaultModel || "default";
   const instructionWidth = Math.max(1, width - 3);
   const rows = [];
-  let cursorRow = 1, cursorCol = 1;
+  let caretRow = 1, caretCol = 1;
 
-  if (fields.includes("harness")) rows.push(`${marker("harness")} Harness: < ${harness.label} >`);
-  if (fields.includes("model")) rows.push(`${marker("model")} Model:   < ${model} >`);
-  if (active === "harness") { cursorRow = 1; cursorCol = [...rows[0]].length + 1; }
-  else if (active === "model") { cursorRow = 2; cursorCol = [...rows[1]].length + 1; }
+  rows.push(`${marker("harness")} Harness: < ${harness.label} >`);
+  if (active === "harness") { caretRow = 1; caretCol = [...rows[0]].length + 1; }
 
   const topRows = rows.length;
-  const budget = Math.max(3, height - topRows);
+  const budget = Math.max(2, height - topRows);
 
   if (state.mode === "task") {
-    const wrapped = wrapPopupText(state.values[0], instructionWidth);
-    rows.push(`${marker("request")} Describe the feature or fix:`, ...wrapped.slice(-Math.max(1, budget - 1)).map((line) => `  ${line}`));
-    if (active === "request") { cursorRow = rows.length; cursorCol = [...rows.at(-1)].length + 1; }
+    const cursor = state.cursors[0];
+    const lines = visualLines(state.values[0], instructionWidth);
+    const row = visualRow(lines, cursor);
+    const visibleCount = Math.max(1, budget - 1);
+    const windowStart = Math.max(0, Math.min(row - Math.floor(visibleCount / 2), lines.length - visibleCount));
+    rows.push(`${marker("request")} Describe the feature or fix:`);
+    const bodyStart = rows.length;
+    rows.push(...lines.slice(windowStart, windowStart + visibleCount).map((line) => `  ${line.text}`));
+    if (active === "request") {
+      caretRow = bodyStart + (row - windowStart) + 1;
+      caretCol = (cursor - lines[row].start) + 3;
+    }
   } else {
+    const target = state.values[0], targetCursor = state.cursors[0], targetChars = [...target];
     const targetPrefix = `${marker("target")} Paste issue or PR: `;
-    const target = targetPrefix + [...state.values[0]].slice(-Math.max(1, width - targetPrefix.length - 1)).join("");
-    const instructions = wrapPopupText(state.values[1], instructionWidth).slice(-Math.max(1, budget - 3));
-    rows.push(target, "─".repeat(Math.max(1, width - 1)), `${marker("instructions")} Custom instructions:`, ...instructions.map((line) => `  ${line}`));
-    if (active === "target") { cursorRow = topRows + 1; cursorCol = [...rows[topRows]].length + 1; }
-    else if (active === "instructions") { cursorRow = rows.length; cursorCol = [...rows.at(-1)].length + 1; }
+    const available = Math.max(1, width - targetPrefix.length - 1);
+    let windowStart = targetCursor <= available ? 0 : targetCursor - available + 1;
+    windowStart = Math.max(0, Math.min(windowStart, Math.max(0, targetChars.length - available)));
+    rows.push(targetPrefix + targetChars.slice(windowStart, windowStart + available).join(""));
+    if (active === "target") { caretRow = topRows + 1; caretCol = targetPrefix.length + (targetCursor - windowStart) + 1; }
+    rows.push("─".repeat(Math.max(1, width - 1)));
+
+    const cursor = state.cursors[1];
+    const lines = visualLines(state.values[1], instructionWidth);
+    const row = visualRow(lines, cursor);
+    const visibleCount = Math.max(1, budget - 3);
+    const instructionsStart = Math.max(0, Math.min(row - Math.floor(visibleCount / 2), lines.length - visibleCount));
+    rows.push(`${marker("instructions")} Custom instructions:`);
+    const bodyStart = rows.length;
+    rows.push(...lines.slice(instructionsStart, instructionsStart + visibleCount).map((line) => `  ${line.text}`));
+    if (active === "instructions") {
+      caretRow = bodyStart + (row - instructionsStart) + 1;
+      caretCol = (cursor - lines[row].start) + 3;
+    }
   }
-  return `\x1b[2J\x1b[H${rows.join("\n")}\x1b[${cursorRow};${cursorCol}H`;
+  return `\x1b[2J\x1b[H${rows.join("\n")}\x1b[${caretRow};${caretCol}H`;
 }
 
 async function dismissProgress() {
@@ -1079,38 +1151,50 @@ async function dismissProgress() {
   } finally { input.setRawMode(false); input.pause(); }
 }
 
+function selectHarness(state, index) {
+  state.harnessIndex = index;
+  state.typeahead = null;
+}
+
+function popupSubmit(state) {
+  return state.values[0].trim() ? "submit" : null;
+}
+
 function popupInputKey(state, sequence, key) {
   sequence ??= key.sequence;
   const fields = popupFields(state);
   const active = fields[state.active];
-  const cycle = (step) => { state.active = (state.active + step + fields.length) % fields.length; };
+  const width = state.width || output.columns || 80;
+  const focus = (index) => {
+    state.active = Math.max(0, Math.min(index, fields.length - 1));
+    state.typeahead = null;
+    const field = fields[state.active];
+    if (field !== "harness") {
+      const valueIndex = textFieldIndex(field);
+      state.cursors[valueIndex] = Math.min(state.cursors[valueIndex], [...state.values[valueIndex]].length);
+    }
+  };
+  const submitting = ["return", "enter"].includes(key.name) || sequence === "\x1b[13;2u";
+
   if (key.name === "escape" || (key.ctrl && key.name === "c") || ["\x1b[27u", "\x1b[99;5u"].includes(sequence)) return "cancel";
-  if (["return", "enter"].includes(key.name) || sequence === "\x1b[13;2u") {
-    const multiline = active === "instructions" || active === "request";
-    if (multiline && (key.shift || sequence === "\x1b[13;2u")) { state.values[textFieldIndex(active)] += "\n"; return "render"; }
-    return state.values[0].trim() ? "submit" : null;
-  }
-  if (key.name === "tab") { state.typeahead = null; cycle(key.shift ? -1 : 1); return "render"; }
+  if (key.name === "tab") { focus((state.active + (key.shift ? -1 : 1) + fields.length) % fields.length); return "render"; }
+
   if (active === "harness") {
-    const select = (index) => {
-      state.harnessIndex = index;
-      const next = state.harnesses[index];
-      state.modelIndex = Math.max(0, (next.models || []).indexOf(next.defaultModel));
-    };
-    const back = ["up", "left"].includes(key.name), forward = ["down", "right"].includes(key.name);
-    if (back || forward) {
-      state.typeahead = null;
-      const step = forward ? 1 : -1;
-      select((state.harnessIndex + step + state.harnesses.length) % state.harnesses.length);
+    if (key.name === "left" || key.name === "right") {
+      const step = key.name === "right" ? 1 : -1;
+      selectHarness(state, (state.harnessIndex + step + state.harnesses.length) % state.harnesses.length);
       return "render";
     }
+    if (key.name === "down") { focus(state.active + 1); return "render"; }
+    if (key.name === "up") return null;
+    if (submitting) return popupSubmit(state);
     if (sequence && /^[A-Za-z0-9]$/.test(sequence) && !key.ctrl && !key.meta) {
       const needle = sequence.toLowerCase();
       const start = state.typeahead === needle ? 1 : 0;
       for (let step = start; step < state.harnesses.length; step += 1) {
         const index = (state.harnessIndex + step) % state.harnesses.length;
         if (!state.harnesses[index].label.toLowerCase().startsWith(needle)) continue;
-        if (step) select(index);
+        if (step) selectHarness(state, index);
         state.typeahead = needle;
         return "render";
       }
@@ -1118,22 +1202,71 @@ function popupInputKey(state, sequence, key) {
     }
     return null;
   }
-  if (active === "model") {
-    const harness = state.harnesses[state.harnessIndex];
-    const back = ["up", "left"].includes(key.name), forward = ["down", "right"].includes(key.name);
-    if (!back && !forward) return null;
-    state.modelIndex = (state.modelIndex + (forward ? 1 : -1) + harness.models.length) % harness.models.length;
+
+  const valueIndex = textFieldIndex(active);
+  const chars = [...state.values[valueIndex]];
+  let cursor = state.cursors[valueIndex];
+  const multiline = active === "instructions" || active === "request";
+  const lineWidth = multiline ? Math.max(1, width - 3) : Math.max(1, width);
+  const lines = visualLines(state.values[valueIndex], lineWidth);
+  const row = visualRow(lines, cursor);
+  const column = cursor - lines[row].start;
+
+  if (submitting) {
+    if (multiline && (key.shift || sequence === "\x1b[13;2u")) {
+      chars.splice(cursor, 0, "\n");
+      state.values[valueIndex] = chars.join("");
+      state.cursors[valueIndex] = cursor + 1;
+      return "render";
+    }
+    return popupSubmit(state);
+  }
+  if (key.name === "left") { if (cursor === 0) return null; state.cursors[valueIndex] = cursor - 1; return "render"; }
+  if (key.name === "right") { if (cursor >= chars.length) return null; state.cursors[valueIndex] = cursor + 1; return "render"; }
+  if (key.name === "home") { state.cursors[valueIndex] = multiline ? lines[row].start : 0; return "render"; }
+  if (key.name === "end") { state.cursors[valueIndex] = multiline ? lines[row].end : chars.length; return "render"; }
+  if (key.name === "up") {
+    if (multiline && row > 0) {
+      state.cursors[valueIndex] = lines[row - 1].start + Math.min(column, lines[row - 1].end - lines[row - 1].start);
+      return "render";
+    }
+    if (state.active > 0) { focus(state.active - 1); return "render"; }
+    return null;
+  }
+  if (key.name === "down") {
+    if (multiline && row < lines.length - 1) {
+      state.cursors[valueIndex] = lines[row + 1].start + Math.min(column, lines[row + 1].end - lines[row + 1].start);
+      return "render";
+    }
+    if (state.active < fields.length - 1) { focus(state.active + 1); return "render"; }
+    return null;
+  }
+  if (key.name === "backspace") {
+    if (cursor === 0) return null;
+    chars.splice(cursor - 1, 1);
+    state.values[valueIndex] = chars.join("");
+    state.cursors[valueIndex] = cursor - 1;
     return "render";
   }
-  if (key.name === "backspace") state.values[textFieldIndex(active)] = [...state.values[textFieldIndex(active)]].slice(0, -1).join("");
-  else if (sequence && !key.ctrl && !key.meta && !sequence.startsWith("\x1b")) state.values[textFieldIndex(active)] += sequence.replace(/\r\n?/g, "\n").replace(/\t/g, "  ");
-  else return null;
-  return "render";
+  if (key.name === "delete") {
+    if (cursor >= chars.length) return null;
+    chars.splice(cursor, 1);
+    state.values[valueIndex] = chars.join("");
+    return "render";
+  }
+  if (sequence && !key.ctrl && !key.meta && !sequence.startsWith("\x1b")) {
+    const inserted = [...sequence.replace(/\r\n?/g, "\n").replace(/\t/g, "  ")];
+    chars.splice(cursor, 0, ...inserted);
+    state.values[valueIndex] = chars.join("");
+    state.cursors[valueIndex] = cursor + inserted.length;
+    return "render";
+  }
+  return null;
 }
 
 function popupSelection(state) {
   const harness = state.harnesses[state.harnessIndex] || harnessList()[0];
-  return { kind: harness.kind, label: harness.label, model: harness.models.length ? harness.models[state.modelIndex] || harness.defaultModel : "" };
+  return { kind: harness.kind, label: harness.label };
 }
 
 function popupHarnesses(harnesses) {
@@ -1144,9 +1277,8 @@ function popupState(mode, harnesses, defaultHarness) {
   const list = popupHarnesses(harnesses);
   if (!list.length) throw new Error("No agent harness is installed; run `herdr integration install <name>`.");
   const harnessIndex = Math.max(0, list.findIndex((harness) => harness.kind === defaultHarness));
-  const state = { mode, harnesses: list, harnessIndex, modelIndex: 0, active: 0, values: ["", ""] };
-  state.modelIndex = Math.max(0, (list[harnessIndex].models || []).indexOf(list[harnessIndex].defaultModel));
-  state.active = popupFields(state).findIndex((field) => field !== "harness" && field !== "model");
+  const state = { mode, harnesses: list, harnessIndex, active: 0, typeahead: null, values: ["", ""], cursors: [0, 0], width: output.columns || 80 };
+  state.active = popupFields(state).findIndex((field) => field !== "harness");
   return state;
 }
 
@@ -1155,17 +1287,16 @@ async function readPopupInput(mode = "github", harnesses, defaultHarness = defau
   const fallback = list.find((harness) => harness.kind === defaultHarness) || list[0];
   if (!fallback) throw new Error("No agent harness is installed; run `herdr integration install <name>`.");
   if (!input.isTTY || typeof input.setRawMode !== "function") {
-    const model = fallback.models.length ? fallback.defaultModel || fallback.models[0] : "";
     const rl = readlinePromises.createInterface({ input, output });
     if (mode === "task") {
       const request = preserveLines(await rl.question("Describe the feature or fix: "));
       rl.close();
-      return request ? { request, harness: fallback.kind, model } : null;
+      return request ? { request, harness: fallback.kind } : null;
     }
     const target = compact(await rl.question("Paste issue or PR: "));
     const instructions = target ? compact(await rl.question("Custom instructions (optional): ")) : "";
     rl.close();
-    return target ? { target, instructions, harness: fallback.kind, model } : null;
+    return target ? { target, instructions, harness: fallback.kind } : null;
   }
   const state = popupState(mode, list, defaultHarness);
   output.write(`\x1b[>1u${popupInputView(state)}`);
@@ -1184,10 +1315,10 @@ async function readPopupInput(mode = "github", harnesses, defaultHarness = defau
       const action = popupInputKey(state, sequence, key);
       if (action === "cancel") return finish(null);
       if (action === "submit") {
-        const { kind, model } = popupSelection(state);
+        const { kind } = popupSelection(state);
         return finish(mode === "task"
-          ? { request: preserveLines(state.values[0]), harness: kind, model }
-          : { target: compact(state.values[0]), instructions: preserveLines(state.values[1]), harness: kind, model });
+          ? { request: preserveLines(state.values[0]), harness: kind }
+          : { target: compact(state.values[0]), instructions: preserveLines(state.values[1]), harness: kind });
       }
       if (action === "render") output.write(popupInputView(state));
     }
@@ -1279,8 +1410,8 @@ module.exports = { autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStar
   harnessStartArgs, installedIntegrations, openInputPopup, openProgressPane,
   popupFields, popupInputKey, popupInputView, popupSelection, popupState,
   project,
-  implementationPullRequest, isAgentPromptStalled, monitor, progressView, readPluginConfig, resolveRepository, sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands,
-  waitForActivity };
+  implementationPullRequest, isAgentPromptStalled, monitor, progressView, readPluginConfig, readPluginState, resolveRepository, sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands,
+  waitForActivity, writePluginState };
 
 if (require.main === module) {
   main().catch((error) => {

@@ -7,16 +7,22 @@ is built around per-harness adapters so new kinds are a one-line addition.
 
 ## Harnesses
 
-Pick the harness in the workflow popup. The first field is a selector:
-`Harness: < Codex >`. Use Up/Down or Left/Right to change it, type the first
-letter of a harness to jump to it, then Tab to the next field. Harnesses that
-expose selectable models show a second `Model: < ... >` selector. Only harnesses
-whose Herdr integration is installed are offered.
+Pick the harness in the workflow popup. The first row is a selector:
+`Harness: < Codex >`. The issue/feature input is focused by default. Arrow keys
+are first-class: Left/Right/Home/End move the caret, and Up/Down move between
+wrapped lines. When the caret reaches the top line, Up moves focus to the
+harness selector; from the selector, Down returns to the input, and Left/Right
+change the harness. On the selector you can also type the first letter of a
+harness to jump to it (repeat to cycle). Tab moves between rows.
+
+The popup selects the harness only; the plugin does not pass a model, so each
+harness launches with its own configured default. Only harnesses whose Herdr
+integration is installed are offered.
 
 | Kind | Label | Session archive | Notes |
 | --- | --- | --- | --- |
 | `codex` | Codex | `codex archive <id>` | Forwards `--auto-account` when the executable advertises it |
-| `opencode` | opencode | `opencode session delete <id>` | Models: `opencode-go/deepseek-flash`, `opencode-go/glm-5.3-flash` |
+| `opencode` | opencode | `opencode session delete <id>` | Uses opencode's own configured model |
 | `claude` | Claude | none, session retained | |
 | `cursor` | Cursor | none, session retained | |
 | `copilot` | Copilot | none, session retained | |
@@ -39,8 +45,8 @@ does not give a stable session (for example `gemini`, `cline`, `kiro`, `amp`,
 and `maki`) are not offered, because cleanup could not verify workspace
 ownership.
 
-The default harness and per-harness models come from the plugin config
-directory (see below).
+The default harness comes from the plugin config directory (see below); the
+last harness you pick is remembered and used as the next default.
 
 ## Install
 
@@ -91,10 +97,10 @@ Then run `herdr server reload-config`.
 
 `issue-to-pr` accepts a complete issue or pull-request URL, partial link, or
 number. A complete GitHub URL selects its repository; the other forms use the
-current repository. Use Tab (Shift+Tab to go back) to move between the harness,
-model, and text fields; Up/Down or Left/Right change the selected harness or
-model. Enter starts the workflow; Shift+Enter adds an instruction line. Long
-target text scrolls horizontally, while instructions wrap and scroll vertically.
+current repository. Enter starts the workflow; Shift+Enter adds an instruction
+line. The caret and field navigation behave like a small editor (see Harnesses
+above). Long target text scrolls horizontally, while instructions wrap and
+scroll vertically.
 GitHub identifies whether the number is an issue or
 pull request. Issue workflows pin the fetched default-branch SHA and start one
 agent parent that owns implementation, review, CI, and an open pull request.
@@ -141,25 +147,15 @@ that directory:
 {"auto-cleanup-on-pr-merge": true}
 ```
 
-The same file selects the default harness and overrides the model list offered
-in the popup:
+The same file sets the default harness:
 
 ```json
-{
-  "default-harness": "opencode",
-  "harnesses": {
-    "opencode": {
-      "models": ["opencode-go/deepseek-flash", "opencode-go/glm-5.3-flash"],
-      "default-model": "opencode-go/deepseek-flash"
-    }
-  }
-}
+{ "default-harness": "opencode" }
 ```
 
 Only harness kinds with a shipped adapter are usable; an unknown
-`default-harness` falls back to `codex`. Model strings must match
-`[A-Za-z0-9][A-Za-z0-9._/-]{0,199}`; entries that do not are dropped, and
-models are only offered for harnesses that support selecting one.
+`default-harness` falls back to `codex`. The last harness you pick is remembered
+in `state.json` and used as the next default.
 
 When enabled, a detached watcher waits for an unambiguous merge, then invokes
 the same current-workflow cleanup used by `Alt+Shift+D`. An open or closed,

@@ -9,8 +9,8 @@ const test = require("node:test");
 const {
   autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, controllerProtocol, harnessStartArgs, installedIntegrations, openInputPopup,
   project,
-  implementationPullRequest, isAgentPromptStalled, monitor, openProgressPane, popupFields, popupInputKey, popupInputView, popupSelection, popupState, progressView, resolveRepository,
-  sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands, waitForActivity,
+  implementationPullRequest, isAgentPromptStalled, monitor, openProgressPane, popupFields, popupInputKey, popupInputView, popupSelection, popupState, progressView, readPluginState, resolveRepository,
+  sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands, waitForActivity, writePluginState,
 } = require("./controller.js");
 const { issuePrompt, prPrompt, taskPrompt, opencodeIssuePrompt } = require("./prompts.js");
 const { getHarness, harnessList, sessionMatches } = require("./harnesses.js");
@@ -33,6 +33,16 @@ test("pull-request merge cleanup is opt-in", (t) => {
   assert.equal(autoCleanupOnPrMerge(directory), false);
   fs.writeFileSync(path.join(directory, "config.json"), '{"auto-cleanup-on-pr-merge":true}');
   assert.equal(autoCleanupOnPrMerge(directory), true);
+});
+
+test("remembers the last harness and defaults to it next time", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-workflows-state-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  assert.deepEqual(readPluginState(directory), {});
+  writePluginState({ "last-harness": "opencode" }, directory);
+  assert.equal(readPluginState(directory)["last-harness"], "opencode");
+  writePluginState({ "auto-cleanup-on-pr-merge": false }, directory);
+  assert.deepEqual(readPluginState(directory), { "last-harness": "opencode", "auto-cleanup-on-pr-merge": false });
 });
 
 test("full links select their repository while shorthand stays current", () => {
@@ -148,31 +158,18 @@ test("popup edits and renders multiline custom instructions", () => {
   assert.match(prPrompt(promptInput), /\$review-suite:review \(note: herdrdev\/herdr uses mode fast\)/);
 });
 
-test("popup selects a harness and its model with the arrow keys", () => {
+test("popup selects a harness with the arrow keys and type-ahead", () => {
   const state = popupState("github", harnessList(), "codex");
-  assert.equal(popupFields(state)[0], "harness");
+  assert.deepEqual(popupFields(state), ["harness", "target", "instructions"]);
   assert.equal(popupSelection(state).kind, "codex");
   state.active = 0;
+  popupInputKey(state, undefined, { name: "right" });
+  assert.equal(popupSelection(state).kind, "opencode");
+  popupInputKey(state, undefined, { name: "left" });
+  assert.equal(popupSelection(state).kind, "codex");
   assert.equal(popupInputKey(state, "o", { name: "o", sequence: "o" }), "render");
   assert.equal(popupSelection(state).kind, "opencode");
-  popupInputKey(state, undefined, { name: "down" });
-  assert.equal(popupSelection(state).kind, "claude");
-  assert.equal(popupFields(state).includes("model"), false);
-  popupInputKey(state, undefined, { name: "up" });
-  assert.equal(popupSelection(state).kind, "opencode");
-  assert.equal(popupInputKey(state, undefined, { name: "up" }), "render");
-  assert.equal(popupSelection(state).kind, "codex");
-  popupInputKey(state, undefined, { name: "down" });
-  const fields = popupFields(state);
-  assert.equal(fields.includes("model"), true);
-  assert.equal(popupSelection(state).model, "opencode-go/deepseek-flash");
-  state.active = fields.indexOf("model");
-  popupInputKey(state, undefined, { name: "right" });
-  assert.equal(popupSelection(state).model, "opencode-go/glm-5.3-flash");
-  popupInputKey(state, undefined, { name: "left" });
-  assert.equal(popupSelection(state).model, "opencode-go/deepseek-flash");
   assert.match(popupInputView(state, 60), /Harness: < opencode >/);
-  assert.match(popupInputView(state, 60), /Model:   < opencode-go\/deepseek-flash >/);
 
   const repeat = popupState("github", harnessList(), "codex");
   repeat.active = 0;
@@ -194,16 +191,80 @@ test("parses installed integrations from Herdr status output", () => {
   assert.equal(installedIntegrations(() => "unrecognized output", quiet), null);
 });
 
+test("arrow keys edit the text and leave the field at the edges", () => {
+  const state = popupState("task", harnessList(), "codex");
+  assert.deepEqual(popupFields(state), ["harness", "request"]);
+  assert.equal(state.active, 1);
+  popupInputKey(state, "abc", { sequence: "abc" });
+  assert.equal(state.values[0], "abc");
+  assert.equal(state.cursors[0], 3);
+  popupInputKey(state, undefined, { name: "left" });
+  assert.equal(state.cursors[0], 2);
+  popupInputKey(state, undefined, { name: "home" });
+  assert.equal(state.cursors[0], 0);
+  assert.equal(popupInputKey(state, undefined, { name: "up" }), "render");
+  assert.equal(state.active, 0);
+  popupInputKey(state, undefined, { name: "down" });
+  assert.equal(state.active, 1);
+  popupInputKey(state, undefined, { name: "end" });
+  assert.equal(state.cursors[0], 3);
+  popupInputKey(state, "X", { sequence: "X" });
+  assert.equal(state.values[0], "abcX");
+});
+
+test("multiline cursor stays in bounds across hard newlines", () => {
+  const state = popupState("task", harnessList(), "codex");
+  popupInputKey(state, "ab", { sequence: "ab" });
+  popupInputKey(state, "\x1b[13;2u", {});
+  popupInputKey(state, "cd", { sequence: "cd" });
+  assert.equal(state.values[0], "ab\ncd");
+  assert.equal(state.cursors[0], 5);
+  popupInputKey(state, undefined, { name: "up" });
+  assert.equal(state.cursors[0], 2);
+  popupInputKey(state, undefined, { name: "up" });
+  assert.equal(state.active, 0);
+  assert.ok(state.cursors[0] >= 0);
+  popupInputKey(state, undefined, { name: "down" });
+  assert.equal(state.active, 1);
+  popupInputKey(state, undefined, { name: "up" });
+  assert.equal(state.cursors[0], 2);
+  assert.doesNotMatch(popupInputView(state, 40, 6), /-1H|;-?\d*0H/);
+});
+
+test("home and end use field edges for the single-line target", () => {
+  const state = popupState("github", harnessList(), "codex");
+  state.values[0] = "x".repeat(100);
+  state.cursors[0] = 100;
+  popupInputKey(state, undefined, { name: "home" });
+  assert.equal(state.cursors[0], 0);
+  popupInputKey(state, undefined, { name: "end" });
+  assert.equal(state.cursors[0], 100);
+  state.active = 2;
+  state.values[1] = "ab\ncd";
+  state.cursors[1] = 5;
+  popupInputKey(state, undefined, { name: "home" });
+  assert.equal(state.cursors[1], 3);
+  popupInputKey(state, undefined, { name: "end" });
+  assert.equal(state.cursors[1], 5);
+});
+
+test("a full-width line before a newline does not render a phantom blank line", () => {
+  const state = popupState("task", harnessList(), "codex");
+  state.values[0] = "abc\nxyz";
+  state.cursors[0] = 7;
+  const body = popupInputView(state, 6, 8).replace(/^\x1b\[2J\x1b\[H/, "").replace(/\x1b\[\d+;\d+H$/, "").split("\n");
+  assert.deepEqual(body, ["  Harness: < Codex >", "> Describe the feature or fix:", "  abc", "  xyz"]);
+});
+
 test("popup refuses to open when no harness integration is available", () => {
   assert.throws(() => popupState("github", [], "codex"), /No agent harness is installed/);
 });
 
 test("harness list filters by installed integrations and defaults to generic cleanup", () => {
-  assert.deepEqual(harnessList({}, new Set(["codex", "opencode"])).map((harness) => harness.kind), ["codex", "opencode"]);
+  assert.deepEqual(harnessList(new Set(["codex", "opencode"])).map((harness) => harness.kind), ["codex", "opencode"]);
   assert.deepEqual(harnessList().map((harness) => harness.kind).slice(0, 3), ["codex", "opencode", "claude"]);
   const claude = getHarness("claude");
   assert.equal(claude.archiveArgs, null);
-  assert.equal(claude.supportsModel, false);
   assert.deepEqual(claude.quit, { keys: ["ctrl+c", "ctrl+c"] });
   assert.equal(sessionMatches(claude, { source: "herdr:claude", kind: "id", value: "abc-123" }), true);
   assert.equal(sessionMatches(claude, { source: "herdr:codex", kind: "id", value: "abc-123" }), false);
@@ -220,19 +281,19 @@ test("opencode and codex expose different session identity and resume semantics"
   assert.equal(opencode.sessionValue("ses_abc123"), true);
   assert.equal(sessionMatches(opencode, { source: "herdr:opencode", kind: "id", value: "ses_abc123" }), true);
   assert.equal(sessionMatches(codex, { source: "herdr:opencode", kind: "id", value: "ses_abc123" }), false);
-  assert.deepEqual(opencode.startArgs("worker", "w1:p2", { model: "opencode-go/deepseek-flash" }), [
-    "agent", "start", "worker", "--kind", "opencode", "--pane", "w1:p2", "--", "--model", "opencode-go/deepseek-flash",
+  assert.deepEqual(opencode.startArgs("worker", "w1:p2"), [
+    "agent", "start", "worker", "--kind", "opencode", "--pane", "w1:p2",
   ]);
   assert.deepEqual(opencode.archiveArgs("ses_abc123"), ["session", "delete", "ses_abc123"]);
-  assert.deepEqual(harnessStartArgs(opencode, "worker", "w1:p2", "opencode-go/deepseek-flash"), [
-    "agent", "start", "worker", "--kind", "opencode", "--pane", "w1:p2", "--", "--model", "opencode-go/deepseek-flash",
+  assert.deepEqual(harnessStartArgs(opencode, "worker", "w1:p2"), [
+    "agent", "start", "worker", "--kind", "opencode", "--pane", "w1:p2",
   ]);
   assert.match(opencode.prompts.issue({ repo: "owner/repo", target: { url: "https://github.com/owner/repo/issues/42" } }), /GitHub CLI/);
   assert.doesNotMatch(opencode.prompts.issue({ repo: "owner/repo", target: { url: "x" } }), /\$review-suite/);
   assert.match(opencodeIssuePrompt({ repo: "owner/repo", target: { url: "x" } }), /pull request/);
 });
 
-test("rejects an unsupported harness or an unoffered model", async () => {
+test("rejects an unsupported or unavailable harness", async () => {
   const attempt = async (message, harnesses = harnessList()) => {
     const runtime = { workflow: "issue", launch: {}, harness: getHarness("codex"), harnesses };
     const connection = {};
@@ -240,30 +301,17 @@ test("rejects an unsupported harness or an unoffered model", async () => {
     await protocol.message({ type: "hello", role: "input" }, connection);
     return protocol.message({ type: "input", target: "#1", ...message }, connection);
   };
-  await assert.rejects(attempt({ harness: "nope", model: "" }), /unsupported harness/);
-  await assert.rejects(attempt({ harness: "opencode", model: "opencode-go/not-real" }), /unsupported opencode model/);
-  await assert.rejects(attempt({ harness: "codex", model: "gpt-5" }), /unsupported Codex model/);
-  await assert.rejects(attempt({ harness: "opencode", model: "" }, harnessList({}, new Set(["codex"]))), /harness is not available/);
-});
-
-test("harness config overrides the offered model list", () => {
-  const list = harnessList({ opencode: { models: ["opencode-go/glm-5.3-flash"], "default-model": "opencode-go/glm-5.3-flash" } });
-  const opencode = list.find((harness) => harness.kind === "opencode");
-  assert.deepEqual(opencode.models, ["opencode-go/glm-5.3-flash"]);
-  assert.equal(opencode.defaultModel, "opencode-go/glm-5.3-flash");
-  assert.deepEqual(list.find((harness) => harness.kind === "codex").models, []);
-  assert.deepEqual(harnessList({ codex: { models: ["gpt-x"] } }).find((harness) => harness.kind === "codex").models, []);
-  assert.deepEqual(harnessList().find((harness) => harness.kind === "opencode").models,
-    ["opencode-go/deepseek-flash", "opencode-go/glm-5.3-flash"]);
+  await assert.rejects(attempt({ harness: "nope" }), /unsupported harness/);
+  await assert.rejects(attempt({ harness: "opencode" }, harnessList(new Set(["codex"]))), /harness is not available/);
 });
 
 test("task input and prompt preserve a multiline request", () => {
   const state = popupState("task", harnessList(), "codex");
   assert.deepEqual(popupFields(state), ["harness", "request"]);
-  state.values[0] = "Build the thing";
+  popupInputKey(state, "Build the thing", { sequence: "Build the thing" });
   assert.match(popupInputView(state, 40, 5), /Describe the feature or fix:\n  Build the thing/);
   assert.equal(popupInputKey(state, "\x1b[13;2u", {}), "render");
-  popupInputKey(state, "Then test it", {});
+  popupInputKey(state, "Then test it", { sequence: "Then test it" });
   assert.equal(state.values[0], "Build the thing\nThen test it");
   assert.equal(popupInputKey(state, "", { name: "return" }), "submit");
 
@@ -314,7 +362,7 @@ test("progress can observe launch status after input submits", async () => {
   await protocol.message({ type: "hello", role: "progress" }, progressConnection);
   assert.equal(hello, true);
   assert.equal(progressHello, true);
-  assert.deepEqual(submitted, { target: "#42", instructions: "focus startup\nthen test", harness: "codex", model: "" });
+  assert.deepEqual(submitted, { target: "#42", instructions: "focus startup\nthen test", harness: "codex" });
   assert.equal((await protocol.message({ type: "status" }, progressConnection)).launch.status, "running");
 
   const taskLifecycle = new Lifecycle(), taskRuntime = { workflow: "task", launch: {} };
@@ -323,15 +371,15 @@ test("progress can observe launch status after input submits", async () => {
   const taskConnection = {};
   await taskProtocol.message({ type: "hello", role: "input" }, taskConnection);
   await taskProtocol.message({ type: "input", request: "Build it\r\nThen test it" }, taskConnection);
-  assert.deepEqual(taskSubmission, { request: "Build it\nThen test it", harness: "codex", model: "" });
+  assert.deepEqual(taskSubmission, { request: "Build it\nThen test it", harness: "codex" });
 
   const opencodeRuntime = { workflow: "issue", launch: {}, harness: getHarness("opencode"), harnesses: harnessList() };
   let opencodeSubmission;
   const opencodeProtocol = controllerProtocol(opencodeRuntime, new Lifecycle(), () => {}, (value) => { opencodeSubmission = value; });
   const opencodeConnection = {};
   await opencodeProtocol.message({ type: "hello", role: "input" }, opencodeConnection);
-  await opencodeProtocol.message({ type: "input", target: "#7", instructions: "", harness: "opencode", model: "opencode-go/glm-5.3-flash" }, opencodeConnection);
-  assert.deepEqual(opencodeSubmission, { target: "#7", instructions: "", harness: "opencode", model: "opencode-go/glm-5.3-flash" });
+  await opencodeProtocol.message({ type: "input", target: "#7", instructions: "", harness: "opencode" }, opencodeConnection);
+  assert.deepEqual(opencodeSubmission, { target: "#7", instructions: "", harness: "opencode" });
 });
 
 test("forwards Codex++ auto-account only when the executable advertises it", () => {
