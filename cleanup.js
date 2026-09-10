@@ -5,8 +5,8 @@ const fs = require("node:fs");
 const crypto = require("node:crypto"), net = require("node:net");
 const { spawn } = require("node:child_process");
 const { WORKTREE_ROOT, normalizePath, parseGitHubRemote, parseSameRepositoryPullRequest, parseWorktreeList } = require("./workflow.js");
+const { DEFAULT_HARNESS, getHarness, sessionMatches: harnessSessionMatches } = require("./harnesses.js");
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TERMINAL_STATES = new Set(["complete", "failed", "cancelled"]);
 const WORKFLOW_KINDS = new Set(["issue", "pr", "task"]);
 
@@ -35,7 +35,7 @@ function recoveredWorkspace(workspace, identity, controllerAlive) {
     workflow_controller: controllerAlive ? "active" : "inactive",
     workflow_cleanup: "manual",
   } };
-  manualWorkspace(restored);
+  manualWorkspace(restored, [], getHarness(identity.workflow_harness) || getHarness(DEFAULT_HARNESS));
   return restored;
 }
 
@@ -44,13 +44,14 @@ function safeReason(error, fallback) {
 }
 
 function validatePayload(value) {
+  const harness = getHarness(value?.harness) || getHarness(DEFAULT_HARNESS);
   if (!value || value.version !== 1 || !WORKFLOW_KINDS.has(value.workflow)
     || !value.workspaceId || !value.rootPaneId || !value.worktreePath || !value.repoRoot
-    || !/^[^/\s]+\/[^/\s]+$/.test(value.repo) || !/^codex\/(?:issue|review-pr|task)-/.test(value.branch) || !UUID.test(value.sessionId)
+    || !/^[^/\s]+\/[^/\s]+$/.test(value.repo) || !/^(?:codex\/|auto-)(?:issue|review-pr|task)-/.test(value.branch) || !harness.sessionValue(value.sessionId)
     || (value.prNumber !== null && (!Number.isSafeInteger(value.prNumber) || value.prNumber < 1))) {
     throw new Error("invalid cleanup watcher payload");
   }
-  return Object.freeze({ ...value, repo: value.repo.toLowerCase() });
+  return Object.freeze({ ...value, repo: value.repo.toLowerCase(), harness: harness.kind });
 }
 
 function encodePayload(value) {
@@ -70,38 +71,36 @@ function associatedPr(workflow, report, originalNumber, repo) {
   return parseSameRepositoryPullRequest(report?.["pr-url"], repo).number;
 }
 
-function matchingSession(agents, workspaceId, rootPaneId) {
+function matchingSession(agents, workspaceId, rootPaneId, harness = getHarness(DEFAULT_HARNESS)) {
   const matches = agents.filter((agent) => agent.workspace_id === workspaceId
     && (!rootPaneId || agent.pane_id === rootPaneId)
-    && agent.agent_session?.source === "herdr:codex"
-    && agent.agent_session.kind === "id"
-    && UUID.test(agent.agent_session.value));
-  if (matches.length !== 1) throw new CleanupStop(`expected one owning Codex session; found ${matches.length}`);
+    && harnessSessionMatches(harness, agent.agent_session));
+  if (matches.length !== 1) throw new CleanupStop(`expected one owning ${harness.label} session; found ${matches.length}`);
   return matches[0];
 }
 
-function matchingOwnedSession(agents, workspaceId, rootPaneId, sessionId) {
-  const agent = matchingSession(agents, workspaceId, rootPaneId);
-  if (!UUID.test(sessionId) || agent.agent_session.value.toLowerCase() !== sessionId.toLowerCase()) throw new CleanupStop("owning Codex session changed");
+function matchingOwnedSession(agents, workspaceId, rootPaneId, sessionId, harness = getHarness(DEFAULT_HARNESS)) {
+  const agent = matchingSession(agents, workspaceId, rootPaneId, harness);
+  if (!harness.sessionValue(sessionId) || agent.agent_session.value.toLowerCase() !== sessionId.toLowerCase()) throw new CleanupStop(`owning ${harness.label} session changed`);
   if (!["idle", "done"].includes(agent.agent_status)) {
-    const error = new CleanupStop("owning Codex session is still active");
+    const error = new CleanupStop(`owning ${harness.label} session is still active`);
     error.retryable = true;
     throw error;
   }
   return agent;
 }
 
-function manualWorkspace(workspace, agents = []) {
+function manualWorkspace(workspace, agents = [], harness = getHarness(DEFAULT_HARNESS)) {
   const worktree = workspace?.worktree;
   let tokens = workspace?.tokens || {};
   const running = tokens.workflow_state === "RUNNING";
-  if (running && (!tokens.workflow_root_pane || !UUID.test(tokens.workflow_session))) {
-    const owner = matchingSession(agents, workspace.workspace_id, tokens.workflow_root_pane);
+  if (running && (!tokens.workflow_root_pane || !harness.sessionValue(tokens.workflow_session))) {
+    const owner = matchingSession(agents, workspace.workspace_id, tokens.workflow_root_pane, harness);
     tokens = { ...tokens, workflow_root_pane: owner.pane_id, workflow_session: owner.agent_session.value };
   }
   if (!worktree?.is_linked_worktree || (!TERMINAL_STATES.has(tokens.workflow_state) && !running)
     || !WORKFLOW_KINDS.has(tokens.workflow_kind) || !tokens.workflow_root_pane
-    || !UUID.test(tokens.workflow_session)) throw new CleanupStop("This workspace has no Codex workflow to clean up.");
+    || !harness.sessionValue(tokens.workflow_session)) throw new CleanupStop("This workspace has no managed workflow to clean up.");
   if (tokens.workflow_controller !== (running ? "active" : "inactive")) throw new CleanupStop("workflow controller state is inconsistent");
   if (running && !String(tokens.workflow_controller_pipe || "").startsWith("\\\\.\\pipe\\herdr-codex-workflows-")) {
     throw new CleanupStop("active workflow does not support coordinated cleanup");
@@ -120,6 +119,7 @@ function assertLocalIdentity(payload, snapshot, allowOwner = false, allowRunning
   const workspace = snapshot.workspace;
   if (!workspace) return false;
   const worktree = workspace.worktree, tokens = workspace.tokens || {};
+  const harness = getHarness(tokens.workflow_harness) || getHarness(payload.harness) || getHarness(DEFAULT_HARNESS);
   if (workspace.workspace_id !== payload.workspaceId || !worktree?.is_linked_worktree
     || normalizePath(worktree.checkout_path) !== normalizePath(payload.worktreePath)
     || normalizePath(worktree.repo_root) !== normalizePath(payload.repoRoot)) throw new CleanupStop("workspace identity changed");
@@ -127,14 +127,14 @@ function assertLocalIdentity(payload, snapshot, allowOwner = false, allowRunning
     || (allowRunning && tokens.workflow_state === "RUNNING" && tokens.workflow_controller === "active");
   const rootMatches = tokens.workflow_root_pane ? tokens.workflow_root_pane === payload.rootPaneId : allowRunning;
   const sessionMatches = tokens.workflow_session ? String(tokens.workflow_session).toLowerCase() === payload.sessionId.toLowerCase() : allowRunning;
-  if (!lifecycleMatches || tokens.workflow_kind !== payload.workflow
+  if (!lifecycleMatches || tokens.workflow_kind !== payload.workflow || harness.kind !== payload.harness
     || tokens.workflow_branch !== payload.branch || !rootMatches || !sessionMatches) {
     throw new CleanupStop("workflow cleanup metadata changed");
   }
   const rootAgents = snapshot.agents.filter((agent) => agent.workspace_id === payload.workspaceId && agent.pane_id === payload.rootPaneId);
   if (rootAgents.length) {
     if (!allowOwner) throw new CleanupStop("root pane agent changed after session archive");
-    matchingOwnedSession(rootAgents, payload.workspaceId, payload.rootPaneId, payload.sessionId);
+    matchingOwnedSession(rootAgents, payload.workspaceId, payload.rootPaneId, payload.sessionId, harness);
   }
   if (snapshot.agents.some((agent) => agent.workspace_id === payload.workspaceId
     && agent.pane_id !== payload.rootPaneId && !["idle", "done"].includes(agent.agent_status))) {
@@ -193,7 +193,7 @@ async function cleanupTransaction(payload, ops, claimed = false) {
     await ops.progress?.(0);
     if (!await preflight(payload, ops, true, abandon)) return { status: "missing" };
   } catch (error) {
-    if (error.retryable) return { status: "retry", reason: safeReason(error, "Owning Codex session is still active.") };
+    if (error.retryable) return { status: "retry", reason: safeReason(error, "Owning agent session is still active.") };
     return { status: "stopped", reason: safeReason(error, "Cleanup preflight failed; the workspace was retained.") };
   }
   try {
@@ -201,14 +201,14 @@ async function cleanupTransaction(payload, ops, claimed = false) {
     if (abandon) await ops.abandon();
     await ops.release(payload.workspaceId, payload.rootPaneId, payload.sessionId, payload.worktreePath);
   } catch (error) {
-    if (error.retryable) return { status: "retry", reason: safeReason(error, "Owning Codex session is still active.") };
-    return { status: "stopped", reason: "Codex session release failed; the workspace and worktree were retained." };
+    if (error.retryable) return { status: "retry", reason: safeReason(error, "Owning agent session is still active.") };
+    return { status: "stopped", reason: "Agent session release failed; the workspace and worktree were retained." };
   }
   try {
     await ops.progress?.(2);
     await ops.archive(payload.sessionId);
   } catch {
-    return { status: "stopped", reason: "Codex session archive failed; the worktree was not removed." };
+    return { status: "stopped", reason: "Agent session archive failed; the worktree was not removed." };
   }
   try {
     await ops.progress?.(3);
@@ -262,11 +262,12 @@ async function watch(payload, ops, interval = 60000) {
       await ops.delay(interval);
     }
   }
+  const label = (getHarness(payload.harness) || getHarness(DEFAULT_HARNESS)).label;
   try {
     if (!await preflight(payload, ops, true)) return "superseded";
   } catch (error) {
     if (!error.retryable) {
-      await ops.project("stopped"); await ops.notify("Codex workflow cleanup stopped", safeReason(error, "Cleanup preflight failed; the workspace was retained."));
+      await ops.project("stopped"); await ops.notify(`${label} workflow cleanup stopped`, safeReason(error, "Cleanup preflight failed; the workspace was retained."));
       return "stopped";
     }
   }
@@ -279,14 +280,14 @@ async function watch(payload, ops, interval = 60000) {
     try { state = classifyPullRequest(await ops.pullRequest(payload.repo, payload.prNumber)); }
     catch { state = "retry"; }
     if (state === "open" || state === "retry") { await ops.delay(interval); continue; }
-    if (state === "closed") { await ops.project("retained"); await ops.notify("Codex workflow retained", "Pull request closed without merge; workspace and branch remain."); return "retained"; }
+    if (state === "closed") { await ops.project("retained"); await ops.notify(`${label} workflow retained`, "Pull request closed without merge; workspace and branch remain."); return "retained"; }
     const result = await ops.cleanup();
     if (result.status === "busy") { await ops.delay(interval); continue; }
     if (result.status === "retry") { await ops.delay(interval); continue; }
     if (result.status === "missing") return "superseded";
-    if (result.status === "removed") { await ops.notify("Codex workflow cleaned up", `Archived its Codex session and removed the worktree; branch ${payload.branch} remains.`); return "removed"; }
+    if (result.status === "removed") { await ops.notify(`${label} workflow cleaned up`, `Archived its ${label} session and removed the worktree; branch ${payload.branch} remains.`); return "removed"; }
     await ops.project(result.status);
-    await ops.notify(result.status === "partial" ? "Codex workflow partially cleaned up" : "Codex workflow cleanup stopped", result.reason);
+    await ops.notify(result.status === "partial" ? `${label} workflow partially cleaned up` : `${label} workflow cleanup stopped`, result.reason);
     return result.status;
   }
 }

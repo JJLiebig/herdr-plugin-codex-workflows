@@ -7,12 +7,13 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {
-  autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, controllerProtocol, openInputPopup,
+  autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, controllerProtocol, harnessStartArgs, openInputPopup,
   project,
-  implementationPullRequest, isAgentPromptStalled, monitor, openProgressPane, popupInputKey, popupInputView, progressView, resolveRepository,
+  implementationPullRequest, isAgentPromptStalled, monitor, openProgressPane, popupFields, popupInputKey, popupInputView, popupSelection, popupState, progressView, resolveRepository,
   sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands, waitForActivity,
 } = require("./controller.js");
-const { issuePrompt, prPrompt, taskPrompt } = require("./prompts.js");
+const { issuePrompt, prPrompt, taskPrompt, opencodeIssuePrompt } = require("./prompts.js");
+const { getHarness, harnessList, sessionMatches } = require("./harnesses.js");
 const {
   Lifecycle,
   collisionReason,
@@ -119,23 +120,25 @@ test("opens popup on Herdr's active pane without rejected target flags", () => {
 });
 
 test("popup edits and renders multiline custom instructions", () => {
-  const state = { active: 0, values: ["", ""] };
+  const state = popupState("github", harnessList(), "codex");
+  assert.deepEqual(popupFields(state), ["harness", "target", "instructions"]);
+  assert.equal(state.active, 1);
   popupInputKey(state, "#42", {});
-  assert.match(popupInputView(state, 40), /\x1b\[1;\d+H$/);
-  popupInputKey(state, "", { name: "down" });
+  assert.match(popupInputView(state, 40), /> Paste issue or PR: #42/);
+  assert.equal(popupInputKey(state, "", { name: "tab" }), "render");
+  assert.equal(state.active, 2);
   popupInputKey(state, "focus startup", {});
   assert.equal(popupInputKey(state, undefined, { name: "undefined", sequence: "\x1b[13;2u" }), "render");
   popupInputKey(state, "then test", {});
-  assert.deepEqual(state, { active: 1, values: ["#42", "focus startup\nthen test"] });
-  assert.match(popupInputView(state, 40, 6), /─+\n> Custom instructions:\n  focus startup\n  then test\x1b\[5;\d+H$/);
+  assert.deepEqual(state.values, ["#42", "focus startup\nthen test"]);
+  assert.match(popupInputView(state, 40, 6), /─+\n> Custom instructions:\n  focus startup\n  then test/);
   assert.equal(popupInputKey(state, "", { name: "return" }), "submit");
   assert.equal(popupInputKey(state, undefined, { name: "undefined", sequence: "\x1b[27u" }), "cancel");
   assert.equal(popupInputKey(state, undefined, { name: "undefined", sequence: "\x1b[99;5u" }), "cancel");
 
   state.values[1] = "x".repeat(100);
-  const long = popupInputView(state, 40, 6).replace(/^\x1b\[2J\x1b\[H/, "").replace(/\x1b\[6;\d+H$/, "");
-  assert.equal(long.split("\n").length, 6);
-  assert.ok(long.split("\n").every((line) => [...line].length < 40));
+  const lines = popupInputView(state, 40, 6).replace(/^\x1b\[2J\x1b\[H/, "").replace(/\x1b\[\d+;\d+H$/, "").split("\n");
+  assert.ok(lines.length <= 6 && lines.every((line) => [...line].length < 40));
 
   const promptInput = { repo: "owner/repo", target: { url: "https://github.com/owner/repo/issues/42" }, prUrl: "https://github.com/owner/repo/pull/42", instructions: "focus startup\nthen test" };
   assert.match(issuePrompt(promptInput), /Important! Custom Instructions:\nfocus startup\nthen test/);
@@ -145,8 +148,76 @@ test("popup edits and renders multiline custom instructions", () => {
   assert.match(prPrompt(promptInput), /\$review-suite:review \(note: herdrdev\/herdr uses mode fast\)/);
 });
 
+test("popup selects a harness and its model with the arrow keys", () => {
+  const state = popupState("github", harnessList(), "codex");
+  assert.equal(popupFields(state)[0], "harness");
+  assert.equal(popupSelection(state).kind, "codex");
+  state.active = 0;
+  popupInputKey(state, undefined, { name: "up" });
+  assert.equal(popupSelection(state).kind, "opencode");
+  popupInputKey(state, undefined, { name: "up" });
+  assert.equal(popupSelection(state).kind, "codex");
+  popupInputKey(state, undefined, { name: "down" });
+  assert.equal(popupSelection(state).kind, "opencode");
+  const fields = popupFields(state);
+  assert.equal(fields.includes("model"), true);
+  assert.equal(popupSelection(state).model, "opencode-go/deepseek-flash");
+  state.active = fields.indexOf("model");
+  popupInputKey(state, undefined, { name: "right" });
+  assert.equal(popupSelection(state).model, "opencode-go/glm-5.3-flash");
+  popupInputKey(state, undefined, { name: "left" });
+  assert.equal(popupSelection(state).model, "opencode-go/deepseek-flash");
+  assert.match(popupInputView(state, 60), /Harness: < opencode >/);
+  assert.match(popupInputView(state, 60), /Model:   < opencode-go\/deepseek-flash >/);
+});
+
+test("opencode and codex expose different session identity and resume semantics", () => {
+  const codex = getHarness("codex"), opencode = getHarness("opencode");
+  assert.equal(codex.sessionValue("019cbe72-e55b-73d1-87d8-4e01f1f75043"), true);
+  assert.equal(codex.sessionValue("ses_abc123"), false);
+  assert.equal(opencode.sessionValue("ses_abc123"), true);
+  assert.equal(sessionMatches(opencode, { source: "herdr:opencode", kind: "id", value: "ses_abc123" }), true);
+  assert.equal(sessionMatches(codex, { source: "herdr:opencode", kind: "id", value: "ses_abc123" }), false);
+  assert.deepEqual(opencode.startArgs("worker", "w1:p2", { model: "opencode-go/deepseek-flash" }), [
+    "agent", "start", "worker", "--kind", "opencode", "--pane", "w1:p2", "--", "--model", "opencode-go/deepseek-flash",
+  ]);
+  assert.deepEqual(opencode.archiveArgs("ses_abc123"), ["session", "delete", "ses_abc123"]);
+  assert.deepEqual(harnessStartArgs(opencode, "worker", "w1:p2", "opencode-go/deepseek-flash"), [
+    "agent", "start", "worker", "--kind", "opencode", "--pane", "w1:p2", "--", "--model", "opencode-go/deepseek-flash",
+  ]);
+  assert.match(opencode.prompts.issue({ repo: "owner/repo", target: { url: "https://github.com/owner/repo/issues/42" } }), /GitHub CLI/);
+  assert.doesNotMatch(opencode.prompts.issue({ repo: "owner/repo", target: { url: "x" } }), /\$review-suite/);
+  assert.match(opencodeIssuePrompt({ repo: "owner/repo", target: { url: "x" } }), /pull request/);
+});
+
+test("rejects an unsupported harness or an unoffered model", async () => {
+  const attempt = async (message) => {
+    const runtime = { workflow: "issue", launch: {}, harness: getHarness("codex"), harnesses: harnessList() };
+    const connection = {};
+    const protocol = controllerProtocol(runtime, new Lifecycle(), () => {}, () => {});
+    await protocol.message({ type: "hello", role: "input" }, connection);
+    return protocol.message({ type: "input", target: "#1", ...message }, connection);
+  };
+  await assert.rejects(attempt({ harness: "nope", model: "" }), /unsupported harness/);
+  await assert.rejects(attempt({ harness: "opencode", model: "opencode-go/not-real" }), /unsupported opencode model/);
+  await assert.rejects(attempt({ harness: "codex", model: "gpt-5" }), /unsupported Codex model/);
+});
+
+test("harness config overrides the offered model list", () => {
+  const list = harnessList({ opencode: { models: ["opencode-go/glm-5.3-flash"], "default-model": "opencode-go/glm-5.3-flash" } });
+  const opencode = list.find((harness) => harness.kind === "opencode");
+  assert.deepEqual(opencode.models, ["opencode-go/glm-5.3-flash"]);
+  assert.equal(opencode.defaultModel, "opencode-go/glm-5.3-flash");
+  assert.deepEqual(list.find((harness) => harness.kind === "codex").models, []);
+  assert.deepEqual(harnessList({ codex: { models: ["gpt-x"] } }).find((harness) => harness.kind === "codex").models, []);
+  assert.deepEqual(harnessList().find((harness) => harness.kind === "opencode").models,
+    ["opencode-go/deepseek-flash", "opencode-go/glm-5.3-flash"]);
+});
+
 test("task input and prompt preserve a multiline request", () => {
-  const state = { mode: "task", active: 0, values: ["Build the thing", ""] };
+  const state = popupState("task", harnessList(), "codex");
+  assert.deepEqual(popupFields(state), ["harness", "request"]);
+  state.values[0] = "Build the thing";
   assert.match(popupInputView(state, 40, 5), /Describe the feature or fix:\n  Build the thing/);
   assert.equal(popupInputKey(state, "\x1b[13;2u", {}), "render");
   popupInputKey(state, "Then test it", {});
@@ -154,8 +225,8 @@ test("task input and prompt preserve a multiline request", () => {
   assert.equal(popupInputKey(state, "", { name: "return" }), "submit");
 
   const identity = makeIdentity("task");
-  assert.match(identity.branch, /^codex\/task-[0-9a-f]{6}$/);
-  assert.equal(identity.directory, identity.branch.slice("codex/".length));
+  assert.match(identity.branch, /^auto-task-[0-9a-f]{6}$/);
+  assert.equal(identity.directory, identity.branch.slice("auto-".length));
   const prompt = taskPrompt({ repo: "owner/repo", request: state.values[0] });
   assert.match(prompt, /Build the thing\nThen test it/);
   assert.match(prompt, /tricky.*\$ask-pro:ask-pro.*otherwise.*\$review-suite:review-plan/);
@@ -200,7 +271,7 @@ test("progress can observe launch status after input submits", async () => {
   await protocol.message({ type: "hello", role: "progress" }, progressConnection);
   assert.equal(hello, true);
   assert.equal(progressHello, true);
-  assert.deepEqual(submitted, { target: "#42", instructions: "focus startup\nthen test" });
+  assert.deepEqual(submitted, { target: "#42", instructions: "focus startup\nthen test", harness: "codex", model: "" });
   assert.equal((await protocol.message({ type: "status" }, progressConnection)).launch.status, "running");
 
   const taskLifecycle = new Lifecycle(), taskRuntime = { workflow: "task", launch: {} };
@@ -209,7 +280,15 @@ test("progress can observe launch status after input submits", async () => {
   const taskConnection = {};
   await taskProtocol.message({ type: "hello", role: "input" }, taskConnection);
   await taskProtocol.message({ type: "input", request: "Build it\r\nThen test it" }, taskConnection);
-  assert.deepEqual(taskSubmission, { request: "Build it\nThen test it" });
+  assert.deepEqual(taskSubmission, { request: "Build it\nThen test it", harness: "codex", model: "" });
+
+  const opencodeRuntime = { workflow: "issue", launch: {}, harness: getHarness("opencode"), harnesses: harnessList() };
+  let opencodeSubmission;
+  const opencodeProtocol = controllerProtocol(opencodeRuntime, new Lifecycle(), () => {}, (value) => { opencodeSubmission = value; });
+  const opencodeConnection = {};
+  await opencodeProtocol.message({ type: "hello", role: "input" }, opencodeConnection);
+  await opencodeProtocol.message({ type: "input", target: "#7", instructions: "", harness: "opencode", model: "opencode-go/glm-5.3-flash" }, opencodeConnection);
+  assert.deepEqual(opencodeSubmission, { target: "#7", instructions: "", harness: "opencode", model: "opencode-go/glm-5.3-flash" });
 });
 
 test("forwards Codex++ auto-account only when the executable advertises it", () => {
