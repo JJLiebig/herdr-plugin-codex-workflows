@@ -41,4 +41,47 @@ function prPrompt(input) {
 ${customInstructions(input)}`;
 }
 
-module.exports = { issuePrompt, prPrompt, taskPrompt };
+function opencodeIssuePrompt(input) {
+  return `You are investigating issue ${input.target.url} on repository ${input.repo}.
+
+1. Read and follow the applicable AGENTS.md. Investigate and reproduce the issue before editing.
+2. Prepare the smallest complete fix and write a brief plan before implementation.
+3. Implement and validate the fix. Keep it minimal and avoid unrelated changes.
+4. Review your own diff for correctness and unrequested changes before finishing.
+5. Push the branch and open a pull request with the GitHub CLI. Do not merge it. Handle CI and any automated reviewers present; verify findings and reply to every addressed inline comment.
+6. Leave a concise recap with the root cause, fix, validation, review state, and pull-request URL.
+${customInstructions(input)}`;
+}
+
+function opencodeTaskPrompt(input) {
+  return `You are implementing this request on repository ${input.repo}:
+
+${input.request}
+
+1. Read and follow the applicable AGENTS.md. Investigate the repository and choose the smallest correct approach before editing.
+2. Write a brief plan before implementation.
+3. Implement and validate the change. Keep it minimal and avoid unrelated changes.
+4. Review your own diff for correctness and unrequested changes before finishing.
+5. Push the branch and open a pull request with the GitHub CLI. Do not merge it. Handle CI and any automated reviewers present; verify findings and reply to every addressed inline comment.
+6. Leave a concise recap with the approach, implementation, validation, review state, and pull-request URL.
+`;
+}
+
+function opencodePrPrompt(input) {
+  return `You are reviewing pull request ${input.prUrl} on repository ${input.repo}.
+
+1. Read and follow the applicable AGENTS.md. Stay strictly read-only: do not edit, commit, push, comment, review, or merge.
+2. Inspect the complete pull request, checks, reviews, and comments. Explain what it does, why, and the relevant architecture.
+3. Judge whether it is the smallest correct change.
+4. Leave a concise recap with risks, verified findings, and actionable review recommendations.
+${customInstructions(input)}`;
+}
+
+const CODEX_PROMPTS = { issue: issuePrompt, task: taskPrompt, pr: prPrompt };
+const OPENCODE_PROMPTS = { issue: opencodeIssuePrompt, task: opencodeTaskPrompt, pr: opencodePrPrompt };
+
+module.exports = {
+  issuePrompt, prPrompt, taskPrompt,
+  opencodeIssuePrompt, opencodePrPrompt, opencodeTaskPrompt,
+  CODEX_PROMPTS, OPENCODE_PROMPTS,
+};

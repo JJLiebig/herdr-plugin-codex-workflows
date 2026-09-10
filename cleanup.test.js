@@ -8,6 +8,7 @@ const {
   associatedPr, classifyPullRequest, cleanupTransaction, encodePayload, handoffWatcher, manualWorkspace, matchingOwnedSession, matchingSession, watch,
   readWorkflowIdentity, writeWorkflowIdentity, recoveredWorkspace,
 } = require("./cleanup.js");
+const { getHarness } = require("./harnesses.js");
 
 const payload = {
   version: 1, workflow: "issue", workspaceId: "w9", rootPaneId: "w9:p1",
@@ -79,6 +80,20 @@ test("captures one root-pane Codex UUID and requires its owner to settle", () =>
   assert.throws(() => matchingOwnedSession([agent()], "w9", "w9:p1", "019cbe72-e55b-73d1-87d8-4e01f1f75044"), /session changed/);
 });
 
+test("accepts opaque opencode session ids and scopes matching by harness", () => {
+  const opencodePayload = { ...payload, harness: "opencode", sessionId: "ses_abc123def" };
+  assert.doesNotThrow(() => encodePayload(opencodePayload));
+  assert.doesNotThrow(() => encodePayload({ ...payload, branch: "auto-issue-9-a" }));
+  assert.doesNotThrow(() => encodePayload({ ...payload, branch: "codex/issue-9-a" }));
+  assert.throws(() => encodePayload({ ...payload, branch: "other/issue-9-a" }), /invalid cleanup watcher payload/);
+  assert.throws(() => encodePayload({ ...opencodePayload, sessionId: "not a valid session" }), /invalid cleanup watcher payload/);
+  const opencodeAgent = { workspace_id: "w9", pane_id: "w9:p1", agent_status: "idle",
+    agent_session: { source: "herdr:opencode", agent: "opencode", kind: "id", value: "ses_abc123def" } };
+  assert.equal(matchingSession([opencodeAgent], "w9", "w9:p1", getHarness("opencode")).agent_session.value, "ses_abc123def");
+  assert.throws(() => matchingSession([opencodeAgent], "w9", "w9:p1", getHarness("codex")), /found 0/);
+  assert.throws(() => matchingOwnedSession([{ ...opencodeAgent, agent_status: "working" }], "w9", "w9:p1", "ses_abc123def", getHarness("opencode")), /still active/);
+});
+
 test("associates implementation terminal URLs and the original review PR", () => {
   assert.equal(associatedPr("issue", { "pr-url": "https://github.com/owner/repo/pull/12" }, null, "owner/repo"), 12);
   assert.equal(associatedPr("task", { "pr-url": "https://github.com/owner/repo/pull/13" }, null, "owner/repo"), 13);
@@ -132,7 +147,7 @@ test("waits for the exact owning agent to become idle before cleanup", async () 
   assert.equal(calls.includes("release"), false);
   assert.equal(calls.includes("archive"), false);
   const resumed = fixture({ ownerResumes: true });
-  assert.deepEqual(await cleanupTransaction(payload, resumed.ops), { status: "retry", reason: "Owning Codex session is still active." });
+  assert.deepEqual(await cleanupTransaction(payload, resumed.ops), { status: "retry", reason: "Owning agent session is still active." });
   assert.equal(resumed.calls.includes("archive"), false);
 });
 
@@ -147,7 +162,7 @@ test("cleanup archives, rechecks, then removes without querying GitHub", async (
   assert.equal((await cleanupTransaction(payload, fixture({ noOwner: true }).ops)).status, "removed");
   const manual = fixture();
   const manualData = await manual.ops.workspace();
-  assert.throws(() => manualWorkspace({ ...manualData, tokens: { workflow_kind: "issue", workflow_state: "complete", workflow_controller: "inactive" } }), /no Codex workflow/);
+  assert.throws(() => manualWorkspace({ ...manualData, tokens: { workflow_kind: "issue", workflow_state: "complete", workflow_controller: "inactive" } }), /no managed workflow/);
   assert.throws(() => manualWorkspace({ ...manualData, tokens: { ...manualData.tokens, workflow_controller: "active", workflow_root_pane: payload.rootPaneId, workflow_session: payload.sessionId } }), /inconsistent/);
   const manualIdentity = manualWorkspace({ ...manualData, tokens: { ...manualData.tokens, workflow_root_pane: payload.rootPaneId, workflow_session: payload.sessionId } });
   assert.equal(manualIdentity.tokens.workflow_session, payload.sessionId);

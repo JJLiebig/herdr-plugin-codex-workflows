@@ -5,11 +5,11 @@ const fs = require("node:fs"), crypto = require("node:crypto");
 const path = require("node:path"), readline = require("node:readline");
 const readlinePromises = require("node:readline/promises"), { spawn, spawnSync } = require("node:child_process");
 const { stdin: input, stdout: output } = require("node:process");
-const { issuePrompt, prPrompt, taskPrompt } = require("./prompts.js");
 const {
   associatedPr, cleanupTransaction, decodePayload, handoffWatcher, manualWorkspace, matchingOwnedSession, matchingSession, watch, withCleanupClaim,
   readWorkflowIdentity, writeWorkflowIdentity, recoveredWorkspace,
 } = require("./cleanup.js");
+const { DEFAULT_HARNESS, getHarness, harnessList, modelValid, normalizeHarness } = require("./harnesses.js");
 const {
   Lifecycle, WORKTREE_ROOT, collisionReason, connectPipe, createPipeServer, makeIdentity,
   makePipeName, parseGitHubRemote, parseTarget, parseWorktreeList,
@@ -18,10 +18,10 @@ const {
 const PLUGIN_ID = "pimpmuckl.codex-workflows";
 const METADATA_SOURCE = "plugin:pimpmuckl.codex-workflows";
 const herdr = process.env.HERDR_BIN_PATH || "herdr", gitBin = process.env.GIT_BIN_PATH || "git";
-const gh = process.env.GH_BIN_PATH || "gh", codexBin = process.env.CODEX_BIN_PATH;
+const gh = process.env.GH_BIN_PATH || "gh";
 const CODE_ROOT = path.dirname(WORKTREE_ROOT);
-const launchSteps = ["Resolve repository", "Prepare request", "Create worktree", "Start Codex"];
-const cleanupSteps = ["Check workspace", "Stop Codex", "Archive session", "Check worktree", "Remove worktree"];
+const launchSteps = ["Resolve repository", "Prepare request", "Create worktree", "Start agent"];
+const cleanupSteps = ["Check workspace", "Stop agent", "Archive session", "Check worktree", "Remove worktree"];
 function readJson(value, fallback = null) {
   try {
     return JSON.parse(value);
@@ -29,13 +29,23 @@ function readJson(value, fallback = null) {
     return fallback;
   }
 }
-function autoCleanupOnPrMerge(configDir = process.env.HERDR_PLUGIN_CONFIG_DIR) {
-  if (!configDir) return false;
+function readPluginConfig(configDir = process.env.HERDR_PLUGIN_CONFIG_DIR) {
+  if (!configDir) return {};
   try {
-    return readJson(fs.readFileSync(path.join(configDir, "config.json"), "utf8"), {})["auto-cleanup-on-pr-merge"] === true;
+    const value = readJson(fs.readFileSync(path.join(configDir, "config.json"), "utf8"), {});
+    return value && typeof value === "object" ? value : {};
   } catch {
-    return false;
+    return {};
   }
+}
+function autoCleanupOnPrMerge(configDir = process.env.HERDR_PLUGIN_CONFIG_DIR) {
+  return readPluginConfig(configDir)["auto-cleanup-on-pr-merge"] === true;
+}
+function configuredHarnesses(config = readPluginConfig()) {
+  return harnessList(config.harnesses || {});
+}
+function defaultHarnessKind(config = readPluginConfig()) {
+  return normalizeHarness(config["default-harness"]) || DEFAULT_HARNESS;
 }
 function execute(command, args) {
   const result = spawnSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true, maxBuffer: 16 * 1024 * 1024 });
@@ -79,16 +89,28 @@ function runCanonicalCodex(args) {
   return execute(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", "codex", ...args]);
 }
 
-function runCodex(args) {
-  return codexBin ? execute(codexBin, args) : runCanonicalCodex(args);
+function runHarness(harness, args) {
+  const override = process.env[harness.envBin];
+  if (override) return execute(override, args);
+  return execute(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", harness.binary, ...args]);
 }
 
-function codexAgentStartArgs(agentName, paneId, readHelp = () => runCanonicalCodex(["--help"])) {
-  const args = ["agent", "start", agentName, "--kind", "codex", "--pane", paneId];
+function advertisesAutoAccount(readHelp = () => runCanonicalCodex(["--help"])) {
   try {
-    if (/(?:^|\s)--auto-account(?=\s|$)/m.test(readHelp())) args.push("--", "--auto-account");
-  } catch {}
-  return args;
+    return /(?:^|\s)--auto-account(?=\s|$)/m.test(readHelp());
+  } catch {
+    return false;
+  }
+}
+
+function harnessStartArgs(harness, agentName, paneId, model = "", readHelp) {
+  const options = { model };
+  if (harness.supportsAutoAccount) options.autoAccount = advertisesAutoAccount(readHelp);
+  return harness.startArgs(agentName, paneId, options);
+}
+
+function codexAgentStartArgs(agentName, paneId, readHelp) {
+  return harnessStartArgs(getHarness("codex"), agentName, paneId, "", readHelp);
 }
 
 function isAgentPromptStalled(stderr) {
@@ -255,6 +277,8 @@ function createWorktree(repository, identity, baseSha) {
 function saveWorkflowIdentity(runtime) {
   writeWorkflowIdentity(git(runtime.worktree.path, ["rev-parse", "--absolute-git-dir"]), {
     workflow_kind: runtime.workflow,
+    workflow_harness: harnessKind(runtime),
+    workflow_model: runtime.model || "",
     workflow_branch: runtime.identity.branch,
     workflow_root_pane: runtime.worktree.root_pane.pane_id,
     workflow_session: runtime.ownerSessionId,
@@ -291,6 +315,21 @@ async function restoreWorkflowIdentity(workspace) {
     ...Object.entries(workspace.tokens).flatMap(([key, value]) => ["--token", `${key}=${value}`])]);
 }
 
+function harnessLabel(runtime) {
+  return runtime.harness?.label || "Codex";
+}
+
+function harnessKind(runtime) {
+  return runtime.harness?.kind || DEFAULT_HARNESS;
+}
+
+function modelOffered(runtime, harness, model) {
+  if (!model) return true;
+  if (!harness.supportsModel) return false;
+  const offered = (runtime.harnesses || []).find((entry) => entry.kind === harness.kind);
+  return offered ? offered.models.includes(model) : modelValid(model);
+}
+
 function project(runtime, state = "working", reason = "", operations = {}) {
   const phase = state === "waiting" ? "waiting" : "working";
   const text = state === "blocked" ? "working · blocked" : phase;
@@ -298,7 +337,7 @@ function project(runtime, state = "working", reason = "", operations = {}) {
   const paneId = runtime.worktree.root_pane.pane_id;
   try {
     const owner = (operations.agent || getAgent)(runtime.identity.agentName);
-    if (owner && !runtime.ownerSessionId) runtime.ownerSessionId = matchingSession([owner], workspaceId, paneId).agent_session.value;
+    if (owner && !runtime.ownerSessionId) runtime.ownerSessionId = matchingSession([owner], workspaceId, paneId, runtime.harness).agent_session.value;
   } catch (error) {
     console.error(`session discovery pending: ${error.message}`);
   }
@@ -309,16 +348,18 @@ function project(runtime, state = "working", reason = "", operations = {}) {
     report([
       "workspace", "report-metadata", workspaceId, "--source", METADATA_SOURCE,
       "--token", `workflow_kind=${runtime.workflow}`,
+      "--token", `workflow_harness=${harnessKind(runtime)}`,
       "--token", `workflow_state=${runtime.lifecycle.state}`,
       "--token", `workflow_phase=${phase}`,
       "--token", "workflow_controller=active",
       "--token", `workflow_branch=${runtime.identity.branch}`,
       "--token", `workflow_controller_pipe=${runtime.controllerPipe}`,
+      ...(runtime.model ? ["--token", `workflow_model=${runtime.model}`] : []),
       ...(runtime.ownerSessionId ? ["--token", `workflow_root_pane=${paneId}`, "--token", `workflow_session=${runtime.ownerSessionId}`] : []),
     ]);
     report([
       "pane", "report-metadata", paneId, "--source", METADATA_SOURCE,
-      "--display-agent", "Codex workflow", "--title", `${runtime.identity.shortLabel} parent`,
+      "--display-agent", `${harnessLabel(runtime)} workflow`, "--title", `${runtime.identity.shortLabel} parent`,
       "--state-label", `working=${text}`, "--state-label", `blocked=${compact(reason) || "needs input"}`,
       "--token", `workflow_phase=${phase}`,
     ]);
@@ -331,7 +372,7 @@ function projectTerminal(runtime, report, candidate = getAgent(runtime.identity.
   const workspaceId = runtime.worktree.workspace.workspace_id;
   const paneId = runtime.worktree.root_pane.pane_id;
   let owner = null;
-  try { owner = candidate && matchingSession([candidate], workspaceId, paneId); } catch {}
+  try { owner = candidate && matchingSession([candidate], workspaceId, paneId, runtime.harness); } catch {}
   if (owner && !runtime.ownerSessionId) runtime.ownerSessionId = owner.agent_session.value;
   captureWorkflowIdentity(runtime);
   const stale = runtime.workflow === "pr" && report.status === "complete" && report["reviewed-head"].toLowerCase() !== report["current-head"].toLowerCase();
@@ -340,17 +381,19 @@ function projectTerminal(runtime, report, candidate = getAgent(runtime.identity.
     runHerdr(["workspace", "rename", workspaceId, `[${runtime.identity.shortLabel}] ${resultText}`]);
     runHerdr([
       "workspace", "report-metadata", workspaceId, "--source", METADATA_SOURCE,
+      "--token", `workflow_harness=${harnessKind(runtime)}`,
       "--token", `workflow_state=${report.status}`,
       "--token", `workflow_controller=${report.status === "complete" ? "active" : "inactive"}`,
       "--token", `workflow_phase=${resultText}`,
+      ...(runtime.model ? ["--token", `workflow_model=${runtime.model}`] : []),
       ...(runtime.ownerSessionId ? ["--token", `workflow_root_pane=${paneId}`, "--token", `workflow_session=${runtime.ownerSessionId}`] : []),
     ]);
-    runHerdr(["pane", "rename", paneId, `${runtime.identity.shortLabel} Codex parent`]);
+    runHerdr(["pane", "rename", paneId, `${runtime.identity.shortLabel} ${harnessLabel(runtime)} parent`]);
   } catch (error) {
     console.error(`terminal metadata update failed: ${error.message}`);
   }
   const body = report.status === "complete" ? report["pr-url"] || resultText : report.reason;
-  notify(`Codex workflow ${report.status}`, body, report.status === "complete" ? "done" : "request");
+  notify(`${harnessLabel(runtime)} workflow ${report.status}`, body, report.status === "complete" ? "done" : "request");
 }
 
 function delay(milliseconds) {
@@ -378,7 +421,7 @@ async function waitForShell(paneId, cwd) {
 async function startParent(runtime, prompt) {
   const paneId = runtime.worktree.root_pane.pane_id;
   await waitForShell(paneId);
-  runHerdr(codexAgentStartArgs(runtime.identity.agentName, paneId));
+  runHerdr(harnessStartArgs(runtime.harness, runtime.identity.agentName, paneId, runtime.model));
   const child = spawn(herdr, ["agent", "prompt", runtime.identity.agentName, prompt, "--wait"], {
     stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
   });
@@ -473,14 +516,14 @@ function projectCleanup(workspaceId, state, workflowState, owner) {
   ]);
 }
 
-function cleanupOps(workspaceId, abandon) {
+function cleanupOps(workspaceId, abandon, harness = getHarness(DEFAULT_HARNESS)) {
   return {
     workspace: async (workspaceId) => getWorkspace(workspaceId),
     agents: async () => listAgents(),
     git: async (cwd, args) => git(cwd, args),
     pullRequest: async (repo, number) => readJson(execute(gh, ["pr", "view", String(number), "--repo", repo, "--json", "state,mergedAt"])),
-    release: releaseOwnedAgent,
-    archive: async (sessionId) => runCodex(["archive", sessionId]),
+    release: (workspaceId, paneId, sessionId, worktreePath) => releaseOwnedAgent(workspaceId, paneId, sessionId, worktreePath, harness),
+    archive: async (sessionId) => runHarness(harness, harness.archiveArgs(sessionId)),
     remove: async (workspaceId) => runHerdr(["worktree", "remove", "--workspace", workspaceId]),
     cleanup: async () => (await cleanupCurrentWorkflow(workspaceId)).result,
     project: async (state) => projectCleanup(workspaceId, state),
@@ -490,7 +533,7 @@ function cleanupOps(workspaceId, abandon) {
       runHerdr(["workspace", "report-metadata", workspaceId, "--source", METADATA_SOURCE,
         "--token", "workflow_phase=merged", "--token", "workflow_pr_state=merged"]);
     },
-    notify: async (title, body) => notify(title, body, title === "Codex workflow cleaned up" ? "done" : "request"),
+    notify: async (title, body) => notify(title, body, / workflow cleaned up$/.test(title) ? "done" : "request"),
     delay,
     ...(abandon ? { abandon: async () => {
       await requestControllerCleanup(abandon);
@@ -502,7 +545,7 @@ async function handoffCleanup(runtime, repository) {
   const workspaceId = runtime.worktree.workspace.workspace_id;
   const rootPaneId = runtime.worktree.root_pane.pane_id;
   const payload = {
-    version: 1, workflow: runtime.workflow, workspaceId, rootPaneId,
+    version: 1, workflow: runtime.workflow, harness: harnessKind(runtime), workspaceId, rootPaneId,
     worktreePath: runtime.worktree.path, repoRoot: repository.root, repo: repository.repo,
     branch: runtime.identity.branch, sessionId: runtime.ownerSessionId,
     prNumber: associatedPr(runtime.workflow, runtime.terminal, runtime.prNumber, repository.repo),
@@ -512,37 +555,56 @@ async function handoffCleanup(runtime, repository) {
     runHerdr([
       "workspace", "report-metadata", workspaceId, "--source", METADATA_SOURCE,
       "--token", "workflow_state=complete", "--token", "workflow_controller=inactive",
+      "--token", `workflow_harness=${harnessKind(runtime)}`,
       "--token", `workflow_branch=${runtime.identity.branch}`, "--token", `workflow_cleanup=${payload.indicatorOnly ? "manual" : "waiting"}`,
     ]);
   });
-  if (!payload.indicatorOnly) notify("Codex workflow waiting for PR merge", "The workspace will be cleaned up after this pull request merges.");
+  if (!payload.indicatorOnly) notify(`${harnessLabel(runtime)} workflow waiting for PR merge`, "The workspace will be cleaned up after this pull request merges.");
 }
 
 async function cleanupCurrentWorkflow(workspaceId, progress) {
   const workspace = getWorkspace(workspaceId);
   if (!workspace) return { result: { status: "missing" }, worktree: null, branch: null };
   await restoreWorkflowIdentity(workspace);
-  const { worktree, tokens } = manualWorkspace(workspace, listAgents());
+  const harness = getHarness(workspace.tokens?.workflow_harness) || getHarness(DEFAULT_HARNESS);
+  const { worktree, tokens } = manualWorkspace(workspace, listAgents(), harness);
   const abandon = tokens.workflow_state === "RUNNING";
   const branch = git(worktree.checkout_path, ["branch", "--show-current"]);
   const payload = {
-    version: 1, workflow: tokens.workflow_kind, workspaceId,
+    version: 1, workflow: tokens.workflow_kind, harness: harness.kind, workspaceId,
     rootPaneId: tokens.workflow_root_pane, worktreePath: worktree.checkout_path, repoRoot: worktree.repo_root,
     repo: parseGitHubRemote(git(worktree.checkout_path, ["remote", "get-url", "origin"])),
     branch, sessionId: tokens.workflow_session, prNumber: null,
   };
   const result = await withCleanupClaim(payload, async () => {
     if (!abandon) projectCleanup(workspaceId, "manual");
-    return cleanupTransaction(payload, { ...cleanupOps(workspaceId, abandon ? { ...payload, controllerPipe: tokens.workflow_controller_pipe } : null), progress }, true);
+    return cleanupTransaction(payload, { ...cleanupOps(workspaceId, abandon ? { ...payload, controllerPipe: tokens.workflow_controller_pipe } : null, harness), progress }, true);
   });
-  return { result, worktree, branch, abandon };
+  return { result, worktree, branch, abandon, harness };
 }
 
-async function releaseOwnedAgent(workspaceId, paneId, sessionId, worktreePath) {
+async function waitForAgentExit(paneId, timeout) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (!getAgent(paneId)) return true;
+    await delay(100);
+  }
+  return !getAgent(paneId);
+}
+
+async function releaseOwnedAgent(workspaceId, paneId, sessionId, worktreePath, harness = getHarness(DEFAULT_HARNESS)) {
   const agent = getAgent(paneId);
   if (agent) {
-    matchingOwnedSession([agent], workspaceId, paneId, sessionId);
-    runHerdr(["agent", "prompt", paneId, "/quit"]);
+    matchingOwnedSession([agent], workspaceId, paneId, sessionId, harness);
+    if (harness.quit.prompt) {
+      runHerdr(["agent", "prompt", paneId, harness.quit.prompt]);
+      await waitForAgentExit(paneId, 5000);
+    }
+    for (const key of harness.quit.keys || []) {
+      if (!getAgent(paneId)) break;
+      try { runHerdr(["agent", "send-keys", paneId, key]); } catch {}
+      await waitForAgentExit(paneId, 1000);
+    }
   }
   await waitForShell(paneId);
   const outsideCwd = path.parse(path.resolve(worktreePath)).root;
@@ -567,7 +629,7 @@ async function requestControllerCleanup(owner) {
 
 async function releaseParent(runtime) {
   return releaseOwnedAgent(runtime.worktree.workspace.workspace_id, runtime.worktree.root_pane.pane_id,
-    runtime.ownerSessionId, runtime.worktree.path);
+    runtime.ownerSessionId, runtime.worktree.path, runtime.harness);
 }
 
 function implementationPullRequest(runtime, repository, matches = readJson(execute(gh, [
@@ -575,7 +637,7 @@ function implementationPullRequest(runtime, repository, matches = readJson(execu
     "--json", "number,url,headRefOid,baseRefName,headRefName",
   ]), [])) {
   if (matches.length === 0) return null;
-  if (matches.length !== 1) throw new Error("Codex left multiple open pull requests for the workflow branch");
+  if (matches.length !== 1) throw new Error(`${harnessLabel(runtime)} left multiple open pull requests for the workflow branch`);
   const pullRequest = matches[0];
   if (!pullRequest.headRefOid || pullRequest.baseRefName !== runtime.baseBranch || pullRequest.headRefName !== runtime.identity.branch
     || !succeeds(gitBin, ["-C", runtime.worktree.path, "merge-base", "--is-ancestor", runtime.baseSha, pullRequest.headRefOid])) {
@@ -609,7 +671,7 @@ async function monitor(runtime, repository, operations = {}) {
     } else if (runtime.prompt?.error) {
       throw runtime.prompt.error;
     } else if (!agent) {
-      throw new Error("Codex parent exited before the workflow completed");
+      throw new Error(`${harnessLabel(runtime)} parent exited before the workflow completed`);
     } else if (runtime.prompt?.finished && ["idle", "done"].includes(agent.agent_status)) {
         if (wasSettled) {
           const resumed = await activity(runtime.identity.agentName);
@@ -618,7 +680,7 @@ async function monitor(runtime, repository, operations = {}) {
         if (resumed) {
           wasSettled = false;
           const projection = resumed.agent_status === "blocked" ? "blocked" : "working";
-          if (projection !== lastProjection) updateProject(runtime, projection, "Codex needs input");
+          if (projection !== lastProjection) updateProject(runtime, projection, `${harnessLabel(runtime)} needs input`);
           lastProjection = projection;
         }
         continue;
@@ -643,7 +705,7 @@ async function monitor(runtime, repository, operations = {}) {
     } else {
       wasSettled = false;
       const projection = agent.agent_status === "blocked" ? "blocked" : "working";
-      if (projection !== lastProjection) updateProject(runtime, projection, "Codex needs input");
+      if (projection !== lastProjection) updateProject(runtime, projection, `${harnessLabel(runtime)} needs input`);
       lastProjection = projection;
     }
     await wait(1000);
@@ -657,7 +719,7 @@ function progressView(launch, frame = 0) {
   const width = 20, filled = Math.round((complete / steps.length) * width);
   const spinner = "|/-\\"[frame % 4];
   const source = launch.repositorySource === "link" ? "full link" : "current workspace";
-  const checkpoint = launch.status === "started" ? (launch.kind === "cleanup" ? "Cleaned up" : "Codex started") : steps[Math.min(step, steps.length - 1)];
+  const checkpoint = launch.status === "started" ? (launch.kind === "cleanup" ? "Cleaned up" : `${launch.harness || "Codex"} started`) : steps[Math.min(step, steps.length - 1)];
   const title = launch.kind === "cleanup" ? "Cleaning up workspace" : `${launch.repo} (${source})`;
   if (launch.status === "failed") return `\x1b[2J\x1b[H${title} stopped — Enter/Esc to close\n${launch.error}\n`;
   return `\x1b[2J\x1b[H${title}\n`
@@ -693,7 +755,7 @@ function controllerProtocol(runtime, lifecycle, resolveHello, resolveInput, reso
         connection.role = "input";
         runtime.inputConnected = true;
         resolveHello();
-        return {};
+        return { harnesses: runtime.harnesses, defaultHarness: harnessKind(runtime) };
       }
       if (message?.type === "hello" && message.role === "progress") {
         connection.role = "progress";
@@ -702,10 +764,21 @@ function controllerProtocol(runtime, lifecycle, resolveHello, resolveInput, reso
       }
       if (connection.role === "input" && ["input", "cancel"].includes(message?.type)) {
         if (lifecycle.state !== "COLLECTING") throw new Error("input was already submitted");
+        let harness;
+        if (message.harness) {
+          harness = getHarness(message.harness);
+          if (!harness) throw new Error(`unsupported harness: ${message.harness}`);
+        } else {
+          harness = runtime.harness || getHarness(DEFAULT_HARNESS);
+        }
+        const offered = (runtime.harnesses || []).find((entry) => entry.kind === harness.kind);
+        const defaultModel = offered ? offered.defaultModel : harness.defaultModel;
+        const model = message.model === undefined ? defaultModel : String(message.model || "");
+        if (message.type === "input" && !modelOffered(runtime, harness, model)) throw new Error(`unsupported ${harness.label} model: ${model}`);
         lifecycle.transition(message.type === "input" ? "submit" : "cancel");
         resolveInput(message.type === "input" ? (runtime.workflow === "task"
-          ? { request: preserveLines(message.request) }
-          : { target: compact(message.target), instructions: preserveLines(message.instructions) }) : null);
+          ? { request: preserveLines(message.request), harness: harness.kind, model }
+          : { target: compact(message.target), instructions: preserveLines(message.instructions), harness: harness.kind, model }) : null);
         return {};
       }
       if (connection.role === "progress" && message?.type === "status") return { launch: { ...runtime.launch } };
@@ -734,7 +807,7 @@ function controllerProtocol(runtime, lifecycle, resolveHello, resolveInput, reso
 }
 
 async function controller(mode = "github") {
-  if (process.platform !== "win32") throw new Error("Codex Workflows supports Windows only");
+  if (process.platform !== "win32") throw new Error("This plugin supports Windows only");
   const context = readJson(process.env.HERDR_PLUGIN_CONTEXT_JSON, {});
   let repository = sourceRepository(context);
   const lifecycle = new Lifecycle();
@@ -747,7 +820,8 @@ async function controller(mode = "github") {
   const progressPromise = new Promise((resolve) => { resolveProgress = resolve; });
   const runtime = {
     workflow: mode === "task" ? "task" : null, lifecycle, terminal: null,
-    controllerPipe: pipeName, cleanupRequest: null,
+    controllerPipe: pipeName, cleanupRequest: null, harnesses: configuredHarnesses(),
+    harness: getHarness(defaultHarnessKind()), model: "",
     launch: { status: "collecting", step: 0, repo: repository.repo, repositorySource: "current" },
   };
   const server = await createPipeServer(pipeName, controllerProtocol(runtime, lifecycle, resolveHello, resolveInput, resolveProgress));
@@ -757,6 +831,10 @@ async function controller(mode = "github") {
     await Promise.race([helloPromise, delay(30000).then(() => { throw new Error("input popup did not connect to its controller"); })]);
     const submission = await inputPromise;
     if (submission === null) return;
+    runtime.harness = getHarness(submission.harness) || runtime.harness;
+    runtime.model = submission.model ?? runtime.harness.defaultModel;
+    if (runtime.model && !modelValid(runtime.model)) throw new Error(`unsupported ${runtime.harness.label} model: ${runtime.model}`);
+    runtime.launch.harness = runtime.harness.label;
     runtime.launch.status = "running";
     let target;
     if (runtime.workflow !== "task") {
@@ -801,7 +879,7 @@ async function controller(mode = "github") {
     };
     runtime.launch.step = 3;
     await delay(0);
-    const prompt = runtime.workflow === "task" ? taskPrompt(promptData) : runtime.workflow === "issue" ? issuePrompt(promptData) : prPrompt(promptData);
+    const prompt = runtime.harness.prompts[runtime.workflow](promptData);
     await startParent(runtime, prompt);
     lifecycle.transition("provisioned");
     runtime.launch.status = "started";
@@ -821,7 +899,7 @@ async function controller(mode = "github") {
         }
         catch (error) {
           try { projectCleanup(runtime.worktree.workspace.workspace_id, "stopped"); } catch (projectError) { console.error(`cleanup metadata update failed: ${projectError.message}`); }
-          notify("Codex workflow PR tracking stopped", "Could not watch for PR merge; the workspace and branch remain.");
+          notify(`${harnessLabel(runtime)} workflow PR tracking stopped`, "Could not watch for PR merge; the workspace and branch remain.");
           console.error(`cleanup handoff failed: ${error.message}`);
         }
     } else {
@@ -837,7 +915,7 @@ async function controller(mode = "github") {
       projectTerminal(runtime, { type: "terminal", status: "failed", reason: error.message });
       try { await releaseParent(runtime); } catch (releaseError) { console.error(`parent release failed: ${releaseError.message}`); }
     } else {
-      notify("Codex workflow failed", error.message);
+      notify(`${harnessLabel(runtime)} workflow failed`, error.message);
     }
     console.error(error.message);
     process.exitCode = 1;
@@ -879,7 +957,7 @@ async function popup() {
   try {
     let reply = await client.request({ type: "hello", role: "input" });
     if (!reply.ok) throw new Error(reply.error);
-    const value = await readPopupInput(process.env.HERDR_CODEX_WORKFLOW_MODE);
+    const value = await readPopupInput(process.env.HERDR_CODEX_WORKFLOW_MODE, reply.harnesses, reply.defaultHarness);
     reply = await client.request(value === null ? { type: "cancel" } : { type: "input", ...value });
     if (!reply.ok) throw new Error(reply.error);
   } finally {
@@ -899,25 +977,58 @@ async function progress() {
   finally { client.socket.end(); }
 }
 
-function popupInputView(state, width = output.columns || 80, height = output.rows || 10) {
-  const task = state.mode === "task";
-  const inputIndex = task ? 0 : 1;
-  const instructionWidth = Math.max(1, width - 3);
-  const wrapped = state.values[inputIndex].split("\n").flatMap((line) => {
+function popupFields(state) {
+  const harness = state.harnesses[state.harnessIndex];
+  const fields = ["harness"];
+  if (harness?.models?.length) fields.push("model");
+  if (state.mode === "task") fields.push("request");
+  else fields.push("target", "instructions");
+  return fields;
+}
+
+function textFieldIndex(field) {
+  return field === "instructions" ? 1 : 0;
+}
+
+function wrapPopupText(value, width) {
+  return String(value || "").split("\n").flatMap((line) => {
     const chars = [...line], lines = [];
-    do lines.push(chars.splice(0, instructionWidth).join("")); while (chars.length);
+    do lines.push(chars.splice(0, width).join("")); while (chars.length);
     return lines;
   });
-  if (task) {
-    const rows = ["Describe the feature or fix:", ...wrapped.slice(-Math.max(1, height - 1)).map((line) => `  ${line}`)];
-    return `\x1b[2J\x1b[H${rows.join("\n")}\x1b[${rows.length};${[...rows.at(-1)].length + 1}H`;
+}
+
+function popupInputView(state, width = output.columns || 80, height = output.rows || 10) {
+  const fields = popupFields(state);
+  const harness = state.harnesses[state.harnessIndex] || { label: "Codex", models: [], defaultModel: "" };
+  const active = fields[state.active];
+  const marker = (field) => (field === active ? ">" : " ");
+  const model = harness.models[state.modelIndex] || harness.defaultModel || "default";
+  const instructionWidth = Math.max(1, width - 3);
+  const rows = [];
+  let cursorRow = 1, cursorCol = 1;
+
+  if (fields.includes("harness")) rows.push(`${marker("harness")} Harness: < ${harness.label} >`);
+  if (fields.includes("model")) rows.push(`${marker("model")} Model:   < ${model} >`);
+  if (active === "harness") { cursorRow = 1; cursorCol = [...rows[0]].length + 1; }
+  else if (active === "model") { cursorRow = 2; cursorCol = [...rows[1]].length + 1; }
+
+  const topRows = rows.length;
+  const budget = Math.max(3, height - topRows);
+
+  if (state.mode === "task") {
+    const wrapped = wrapPopupText(state.values[0], instructionWidth);
+    rows.push(`${marker("request")} Describe the feature or fix:`, ...wrapped.slice(-Math.max(1, budget - 1)).map((line) => `  ${line}`));
+    if (active === "request") { cursorRow = rows.length; cursorCol = [...rows.at(-1)].length + 1; }
+  } else {
+    const targetPrefix = `${marker("target")} Paste issue or PR: `;
+    const target = targetPrefix + [...state.values[0]].slice(-Math.max(1, width - targetPrefix.length - 1)).join("");
+    const instructions = wrapPopupText(state.values[1], instructionWidth).slice(-Math.max(1, budget - 3));
+    rows.push(target, "─".repeat(Math.max(1, width - 1)), `${marker("instructions")} Custom instructions:`, ...instructions.map((line) => `  ${line}`));
+    if (active === "target") { cursorRow = topRows + 1; cursorCol = [...rows[topRows]].length + 1; }
+    else if (active === "instructions") { cursorRow = rows.length; cursorCol = [...rows.at(-1)].length + 1; }
   }
-  const targetPrefix = `${state.active === 0 ? ">" : " "} Paste issue or PR: `;
-  const target = targetPrefix + [...state.values[0]].slice(-Math.max(1, width - targetPrefix.length - 1)).join("");
-  const instructions = wrapped.slice(-Math.max(1, height - 3));
-  const rows = [target, "─".repeat(Math.max(1, width - 1)), `${state.active === 1 ? ">" : " "} Custom instructions:`, ...instructions.map((line) => `  ${line}`)];
-  const cursorRow = state.active === 0 ? 1 : rows.length;
-  return `\x1b[2J\x1b[H${rows.join("\n")}\x1b[${cursorRow};${[...rows[cursorRow - 1]].length + 1}H`;
+  return `\x1b[2J\x1b[H${rows.join("\n")}\x1b[${cursorRow};${cursorCol}H`;
 }
 
 async function dismissProgress() {
@@ -940,34 +1051,67 @@ async function dismissProgress() {
 
 function popupInputKey(state, sequence, key) {
   sequence ??= key.sequence;
+  const fields = popupFields(state);
+  const active = fields[state.active];
+  const cycle = (step) => { state.active = (state.active + step + fields.length) % fields.length; };
   if (key.name === "escape" || (key.ctrl && key.name === "c") || ["\x1b[27u", "\x1b[99;5u"].includes(sequence)) return "cancel";
   if (["return", "enter"].includes(key.name) || sequence === "\x1b[13;2u") {
-    if ((state.mode === "task" || state.active === 1) && (key.shift || sequence === "\x1b[13;2u")) { state.values[state.active] += "\n"; return "render"; }
+    const multiline = active === "instructions" || active === "request";
+    if (multiline && (key.shift || sequence === "\x1b[13;2u")) { state.values[textFieldIndex(active)] += "\n"; return "render"; }
     return state.values[0].trim() ? "submit" : null;
   }
-  if (state.mode !== "task" && key.name === "tab") state.active = 1 - state.active;
-  else if (state.mode !== "task" && ["right", "down"].includes(key.name)) state.active = 1;
-  else if (state.mode !== "task" && ["left", "up"].includes(key.name)) state.active = 0;
-  else if (key.name === "backspace") state.values[state.active] = [...state.values[state.active]].slice(0, -1).join("");
-  else if (sequence && !key.ctrl && !key.meta && !sequence.startsWith("\x1b")) state.values[state.active] += sequence.replace(/\r\n?/g, "\n").replace(/\t/g, "  ");
+  if (key.name === "tab") { cycle(key.shift ? -1 : 1); return "render"; }
+  if (active === "harness" || active === "model") {
+    const harness = state.harnesses[state.harnessIndex];
+    const back = ["up", "left"].includes(key.name), forward = ["down", "right"].includes(key.name);
+    if (!back && !forward) return null;
+    if (active === "harness") {
+      state.harnessIndex = (state.harnessIndex + (forward ? 1 : -1) + state.harnesses.length) % state.harnesses.length;
+      const next = state.harnesses[state.harnessIndex];
+      state.modelIndex = Math.max(0, (next.models || []).indexOf(next.defaultModel));
+    } else {
+      state.modelIndex = (state.modelIndex + (forward ? 1 : -1) + harness.models.length) % harness.models.length;
+    }
+    return "render";
+  }
+  if (key.name === "backspace") state.values[textFieldIndex(active)] = [...state.values[textFieldIndex(active)]].slice(0, -1).join("");
+  else if (sequence && !key.ctrl && !key.meta && !sequence.startsWith("\x1b")) state.values[textFieldIndex(active)] += sequence.replace(/\r\n?/g, "\n").replace(/\t/g, "  ");
   else return null;
   return "render";
 }
 
-async function readPopupInput(mode = "github") {
+function popupSelection(state) {
+  const harness = state.harnesses[state.harnessIndex] || harnessList()[0];
+  return { kind: harness.kind, label: harness.label, model: harness.models.length ? harness.models[state.modelIndex] || harness.defaultModel : "" };
+}
+
+function popupState(mode, harnesses, defaultHarness) {
+  const list = Array.isArray(harnesses) && harnesses.length ? harnesses : harnessList();
+  const harnessIndex = Math.max(0, list.findIndex((harness) => harness.kind === defaultHarness));
+  const state = { mode, harnesses: list, harnessIndex, modelIndex: 0, active: 0, values: ["", ""] };
+  state.modelIndex = Math.max(0, (list[harnessIndex].models || []).indexOf(list[harnessIndex].defaultModel));
+  state.active = popupFields(state).findIndex((field) => field !== "harness" && field !== "model");
+  return state;
+}
+
+async function readPopupInput(mode = "github", harnesses, defaultHarness = defaultHarnessKind()) {
+  const selection = harnessList();
   if (!input.isTTY || typeof input.setRawMode !== "function") {
+    const fallback = (Array.isArray(harnesses) && harnesses.length ? harnesses : selection)
+      .find((harness) => harness.kind === defaultHarness) || selection[0];
+    const model = fallback.models.length ? fallback.defaultModel || fallback.models[0] : "";
     const rl = readlinePromises.createInterface({ input, output });
     if (mode === "task") {
       const request = preserveLines(await rl.question("Describe the feature or fix: "));
       rl.close();
-      return request ? { request } : null;
+      return request ? { request, harness: fallback.kind, model } : null;
     }
     const target = compact(await rl.question("Paste issue or PR: "));
     const instructions = target ? compact(await rl.question("Custom instructions (optional): ")) : "";
     rl.close();
-    return target ? { target, instructions } : null;
+    return target ? { target, instructions, harness: fallback.kind, model } : null;
   }
-  const state = { mode, active: 0, values: ["", ""] };
+  const state = popupState(mode, harnesses, defaultHarness);
   output.write(`\x1b[>1u${popupInputView(state)}`);
   readline.emitKeypressEvents(input);
   input.setRawMode(true);
@@ -983,9 +1127,12 @@ async function readPopupInput(mode = "github") {
     function onKey(sequence, key) {
       const action = popupInputKey(state, sequence, key);
       if (action === "cancel") return finish(null);
-      if (action === "submit") return finish(mode === "task"
-        ? { request: preserveLines(state.values[0]) }
-        : { target: compact(state.values[0]), instructions: preserveLines(state.values[1]) });
+      if (action === "submit") {
+        const { kind, model } = popupSelection(state);
+        return finish(mode === "task"
+          ? { request: preserveLines(state.values[0]), harness: kind, model }
+          : { target: compact(state.values[0]), instructions: preserveLines(state.values[1]), harness: kind, model });
+      }
       if (action === "render") output.write(popupInputView(state));
     }
     input.on("keypress", onKey);
@@ -997,18 +1144,19 @@ async function runCleanup(context, progress) {
   let cleanup;
   try { cleanup = await cleanupCurrentWorkflow(context.workspace_id, progress); }
   catch (error) {
-    notify("Codex workflow cleanup stopped", error.message);
+    notify("Workflow cleanup stopped", error.message);
     throw error;
   }
-  const { result, worktree, branch, abandon } = cleanup;
-  if (result.status === "removed") return notify("Codex workflow cleaned up", `Archived its Codex session and removed ${worktree.checkout_path}; branch ${branch} remains.`, "done");
+  const { result, worktree, branch, abandon, harness } = cleanup;
+  const label = harness?.label || "Codex";
+  if (result.status === "removed") return notify(`${label} workflow cleaned up`, `Archived its ${label} session and removed ${worktree.checkout_path}; branch ${branch} remains.`, "done");
   if (result.status === "missing") return;
   if (result.status === "busy") {
-    notify("Codex workflow cleanup stopped", result.reason);
+    notify(`${label} workflow cleanup stopped`, result.reason);
     throw new Error(result.reason);
   }
   if (!abandon) projectCleanup(context.workspace_id, result.status);
-  notify(result.status === "partial" ? "Codex workflow partially cleaned up" : "Codex workflow cleanup stopped", result.reason);
+  notify(result.status === "partial" ? `${label} workflow partially cleaned up` : `${label} workflow cleanup stopped`, result.reason);
   throw new Error(result.reason);
 }
 
@@ -1056,7 +1204,8 @@ async function watcher(encodedPayload) {
   const disconnected = new Promise((resolve) => process.once("disconnect", resolve));
   await new Promise((resolve, reject) => process.send({ type: "armed" }, (error) => error ? reject(error) : resolve()));
   await disconnected;
-  return watch(payload, cleanupOps(payload.workspaceId));
+  const harness = getHarness(payload.harness) || getHarness(DEFAULT_HARNESS);
+  return watch(payload, cleanupOps(payload.workspaceId, null, harness));
 }
 
 async function main() {
@@ -1069,9 +1218,11 @@ async function main() {
   throw new Error("expected start, popup, progress, cleanup, or watch mode");
 }
 
-module.exports = { autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, controllerProtocol, openInputPopup, openProgressPane,
+module.exports = { autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, configuredHarnesses, controllerProtocol, defaultHarnessKind,
+  harnessStartArgs, openInputPopup, openProgressPane,
+  popupFields, popupInputKey, popupInputView, popupSelection, popupState,
   project,
-  implementationPullRequest, isAgentPromptStalled, monitor, popupInputKey, popupInputView, progressView, resolveRepository, sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands,
+  implementationPullRequest, isAgentPromptStalled, monitor, progressView, readPluginConfig, resolveRepository, sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands,
   waitForActivity };
 
 if (require.main === module) {
