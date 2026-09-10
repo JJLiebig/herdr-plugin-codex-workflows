@@ -88,9 +88,9 @@ function configuredHarnesses() {
   return harnessList(installedIntegrations());
 }
 function defaultHarnessKind(configDir = process.env.HERDR_PLUGIN_CONFIG_DIR) {
-  return normalizeHarness(readPluginState(configDir)["last-harness"])
-    || normalizeHarness(readPluginConfig(configDir)["default-harness"])
-    || DEFAULT_HARNESS;
+  const remembered = readPluginState(configDir)["last-harness"];
+  const configured = readPluginConfig(configDir)["default-harness"];
+  return (remembered && normalizeHarness(remembered)) || (configured && normalizeHarness(configured)) || DEFAULT_HARNESS;
 }
 function execute(command, args) {
   const result = spawnSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true, maxBuffer: 16 * 1024 * 1024 });
@@ -531,9 +531,10 @@ async function stopParent(runtime) {
       }
     }
   } finally {
-    if (!runtime.prompt.finished) {
-      const closed = new Promise((resolve) => runtime.prompt.child.once("close", resolve));
-      runtime.prompt.child.kill(); await Promise.race([closed, delay(5000)]);
+    if (!runtime.prompt.finished && runtime.prompt.child) {
+      const child = runtime.prompt.child;
+      const closed = new Promise((resolve) => child.once("close", resolve));
+      child.kill(); await Promise.race([closed, delay(5000)]);
     }
   }
 }

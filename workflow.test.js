@@ -7,7 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {
-  autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, controllerProtocol, harnessStartArgs, installedIntegrations, openInputPopup,
+  autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, controllerProtocol, defaultHarnessKind, harnessStartArgs, installedIntegrations, openInputPopup,
   project,
   implementationPullRequest, isAgentPromptStalled, monitor, openProgressPane, popupFields, popupInputKey, popupInputView, popupSelection, popupState, progressView, readPluginState, resolveRepository,
   sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands, waitForActivity, writePluginState,
@@ -43,6 +43,16 @@ test("remembers the last harness and defaults to it next time", (t) => {
   assert.equal(readPluginState(directory)["last-harness"], "opencode");
   writePluginState({ "auto-cleanup-on-pr-merge": false }, directory);
   assert.deepEqual(readPluginState(directory), { "last-harness": "opencode", "auto-cleanup-on-pr-merge": false });
+});
+
+test("default harness prefers the remembered value, then config, then codex", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-workflows-default-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  assert.equal(defaultHarnessKind(directory), "codex");
+  fs.writeFileSync(path.join(directory, "config.json"), JSON.stringify({ "default-harness": "opencode" }));
+  assert.equal(defaultHarnessKind(directory), "opencode");
+  writePluginState({ "last-harness": "claude" }, directory);
+  assert.equal(defaultHarnessKind(directory), "claude");
 });
 
 test("full links select their repository while shorthand stays current", () => {
