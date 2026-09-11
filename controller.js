@@ -595,7 +595,7 @@ function cleanupOps(workspaceId, abandon, harness = getHarness(DEFAULT_HARNESS))
     project: async (state) => projectCleanup(workspaceId, state),
     merged: async (workspace) => {
       const prefix = workspace.label.match(/^\[[^\]]+\]/)?.[0] || workspace.label;
-      runHerdr(["workspace", "rename", workspaceId, `${prefix} merged ✓`]);
+      runHerdr(["workspace", "rename", workspaceId, `✓ ${prefix} merged`]);
       runHerdr(["workspace", "report-metadata", workspaceId, "--source", METADATA_SOURCE,
         "--token", "workflow_phase=merged", "--token", "workflow_pr_state=merged"]);
     },
