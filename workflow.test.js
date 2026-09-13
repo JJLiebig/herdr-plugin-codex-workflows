@@ -7,7 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {
-  autoCleanupOnPrMerge, canonicalRepositoryRoot, checksSummary, codexAgentStartArgs, completeGitHubTarget, controllerProtocol, defaultHarnessKind, harnessStartArgs, installedIntegrations, openInputPopup,
+  autoCleanupOnPrMerge, canonicalRepositoryRoot, checksSummary, codexAgentStartArgs, completeGitHubTarget, confirmView, controllerProtocol, defaultHarnessKind, harnessStartArgs, installedIntegrations, openConfirmPopup, openInputPopup,
   project,
   implementationPullRequest, isAgentPromptStalled, monitor, openProgressPane, popupFields, popupInputKey, popupInputView, popupSelection, popupState, progressView, pullRequestReadiness, readPluginState, resolveRepository,
   sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands, trackedPullRequest, waitForActivity, writePluginState,
@@ -137,6 +137,17 @@ test("opens popup on Herdr's active pane without rejected target flags", () => {
   assert.equal(args[args.indexOf("--cwd") + 1], __dirname);
   assert.equal(args[args.indexOf("HERDR_CODEX_WORKFLOW_MODE=task") - 1], "--env");
   assert.equal(args.at(-1), "--focus");
+});
+
+test("opens a focused confirmation popup for a dirty cleanup", () => {
+  let args;
+  openConfirmPopup("pipe-1", (value) => { args = value; });
+  assert.deepEqual(args.slice(0, 4), ["plugin", "pane", "open", "--plugin"]);
+  assert.equal(args[args.indexOf("--entrypoint") + 1], "confirm");
+  assert.equal(args[args.indexOf("--cwd") + 1], __dirname);
+  assert.equal(args[args.indexOf("HERDR_CODEX_WORKFLOW_PIPE=pipe-1") - 1], "--env");
+  assert.equal(args.at(-1), "--focus");
+  assert.match(confirmView("This workflow worktree has uncommitted changes."), /remove it anyway/i);
 });
 
 test("popup edits and renders multiline custom instructions", () => {

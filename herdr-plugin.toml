@@ -36,3 +36,11 @@ id = "progress"
 title = "Starting workflow"
 placement = "split"
 command = ["node", "controller.js", "progress"]
+
+[[panes]]
+id = "confirm"
+title = "Remove worktree?"
+placement = "popup"
+width = "60%"
+height = 9
+command = ["node", "controller.js", "confirm"]

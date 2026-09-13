@@ -607,17 +607,18 @@ function projectCleanup(workspaceId, state, workflowState, owner) {
   ]);
 }
 
-function cleanupOps(workspaceId, abandon, harness = getHarness(DEFAULT_HARNESS)) {
+function cleanupOps(workspaceId, abandon, harness = getHarness(DEFAULT_HARNESS), force = false) {
   return {
     workspace: async (workspaceId) => getWorkspace(workspaceId),
     agents: async () => listAgents(),
     git: async (cwd, args) => git(cwd, args),
+    force,
     pullRequest: async (repo, number) => readJson(execute(gh, ["pr", "view", String(number), "--repo", repo, "--json", "state,mergedAt"])),
     release: (workspaceId, paneId, sessionId, worktreePath) => releaseOwnedAgent(workspaceId, paneId, sessionId, worktreePath, harness),
     archive: async (sessionId) => {
       if (harness.archiveArgs) runHarness(harness, harness.archiveArgs(sessionId));
     },
-    remove: async (workspaceId) => runHerdr(["worktree", "remove", "--workspace", workspaceId]),
+    remove: async (workspaceId) => runHerdr(["worktree", "remove", "--workspace", workspaceId, ...(force ? ["--force"] : [])]),
     cleanup: async () => (await cleanupCurrentWorkflow(workspaceId)).result,
     project: async (state) => projectCleanup(workspaceId, state),
     merged: async (workspace) => {
@@ -655,24 +656,33 @@ async function handoffCleanup(runtime, repository) {
   if (!payload.indicatorOnly) notify(`${harnessLabel(runtime)} workflow waiting for PR merge`, "The workspace will be cleaned up after this pull request merges.");
 }
 
-async function cleanupCurrentWorkflow(workspaceId, progress) {
+async function cleanupCurrentWorkflow(workspaceId, progress, confirm) {
   const workspace = getWorkspace(workspaceId);
   if (!workspace) return { result: { status: "missing" }, worktree: null, branch: null };
   await restoreWorkflowIdentity(workspace);
   const harness = getHarness(workspace.tokens?.workflow_harness) || getHarness(DEFAULT_HARNESS);
   const { worktree, tokens } = manualWorkspace(workspace, listAgents(), harness);
   const abandon = tokens.workflow_state === "RUNNING";
-  const branch = git(worktree.checkout_path, ["branch", "--show-current"]);
+  const branch = tokens.workflow_branch || git(worktree.checkout_path, ["branch", "--show-current"]);
   const payload = {
     version: 1, workflow: tokens.workflow_kind, harness: harness.kind, workspaceId,
     rootPaneId: tokens.workflow_root_pane, worktreePath: worktree.checkout_path, repoRoot: worktree.repo_root,
     repo: parseGitHubRemote(git(worktree.checkout_path, ["remote", "get-url", "origin"])),
     branch, sessionId: tokens.workflow_session, prNumber: null,
   };
-  const result = await withCleanupClaim(payload, async () => {
+  const attempt = (force) => withCleanupClaim(payload, async () => {
     if (!abandon) projectCleanup(workspaceId, "manual");
-    return cleanupTransaction(payload, { ...cleanupOps(workspaceId, abandon ? { ...payload, controllerPipe: tokens.workflow_controller_pipe } : null, harness), progress }, true);
+    return cleanupTransaction(payload, {
+      ...cleanupOps(workspaceId, abandon ? { ...payload, controllerPipe: tokens.workflow_controller_pipe } : null, harness, force),
+      progress,
+    }, true);
   });
+  let result = await attempt(false);
+  if (result.status === "dirty") {
+    const approved = confirm ? await confirm("This workflow worktree has uncommitted changes.") : false;
+    result = approved ? await attempt(true)
+      : { status: "stopped", reason: "Cleanup cancelled; the worktree has uncommitted changes." };
+  }
   return { result, worktree, branch, abandon, harness };
 }
 
@@ -853,6 +863,15 @@ function openProgressPane(pipeName, context, open = runHerdrJson, resize = runHe
     "--cwd", __dirname, "--env", `HERDR_CODEX_WORKFLOW_PIPE=${pipeName}`, "--no-focus",
   ]);
   resize(["pane", "resize", "--pane", context.focused_pane_id, "--direction", "down", "--amount", "0.4"]);
+}
+
+function openConfirmPopup(pipeName, invoke = runHerdr) {
+  invoke([
+    "plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint", "confirm",
+    "--cwd", __dirname,
+    "--env", `HERDR_CODEX_WORKFLOW_PIPE=${pipeName}`,
+    "--focus",
+  ]);
 }
 
 function controllerProtocol(runtime, lifecycle, resolveHello, resolveInput, resolveProgress = () => {}) {
@@ -1086,6 +1105,59 @@ async function progress() {
     await dismissProgress();
   }
   finally { client.socket.end(); }
+}
+
+function confirmView(question) {
+  return `\x1b[2J\x1b[HRemove worktree anyway?\n\n${question}\n\n`
+    + `  [Y] Yes, I know — remove it anyway\n`
+    + `  [N] No, keep the worktree\n\n`
+    + `Press Y or N.\n`;
+}
+
+async function readConfirm(question) {
+  if (!input.isTTY || typeof input.setRawMode !== "function") {
+    const rl = readlinePromises.createInterface({ input, output });
+    try {
+      const answer = compact(await rl.question(`${question} Remove anyway? (y/N) `)).toLowerCase();
+      return answer === "y" || answer === "yes";
+    } finally { rl.close(); }
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    input.setRawMode(true);
+    readline.emitKeypressEvents(input);
+    input.resume();
+    output.write(confirmView(question));
+    function finish(approved) {
+      if (settled) return;
+      settled = true;
+      input.off("keypress", onKey);
+      input.setRawMode(false);
+      input.pause();
+      output.write(approved ? "\nRemoving anyway.\n" : "\nKeeping the worktree.\n");
+      resolve(approved);
+    }
+    function onKey(sequence, key) {
+      const value = String(sequence || "").toLowerCase();
+      if (value === "y") return finish(true);
+      if (value === "n" || key?.name === "escape" || (key?.ctrl && key?.name === "c")) return finish(false);
+    }
+    input.on("keypress", onKey);
+  });
+}
+
+async function confirmPane() {
+  const pipeName = process.env.HERDR_CODEX_WORKFLOW_PIPE;
+  if (!pipeName) throw new Error("confirmation pane was not launched by a cleanup controller");
+  const client = await connectPipe(pipeName);
+  try {
+    const reply = await client.request({ type: "hello", role: "confirm" });
+    if (!reply.ok) throw new Error(reply.error);
+    const approved = await readConfirm(reply.question || "This workflow worktree has uncommitted changes.");
+    await client.request({ type: "decision", value: approved });
+  } finally {
+    client.socket.end();
+  }
 }
 
 function popupFields(state) {
@@ -1369,10 +1441,10 @@ async function readPopupInput(mode = "github", harnesses, defaultHarness = defau
   });
 }
 
-async function runCleanup(context, progress) {
+async function runCleanup(context, progress, confirm) {
   if (!context.workspace_id) throw new Error("cleanup requires a current workflow workspace");
   let cleanup;
-  try { cleanup = await cleanupCurrentWorkflow(context.workspace_id, progress); }
+  try { cleanup = await cleanupCurrentWorkflow(context.workspace_id, progress, confirm); }
   catch (error) {
     notify("Workflow cleanup stopped", error.message);
     throw error;
@@ -1398,14 +1470,40 @@ async function cleanup() {
   let ready, delivered;
   const connected = new Promise((resolve) => { ready = resolve; });
   const finished = new Promise((resolve) => { delivered = resolve; });
+  let confirmQuestion = "";
+  let resolveConfirm = null;
   const server = await createPipeServer(pipeName, {
-    message(message) {
+    message(message, connection) {
+      if (message.type === "hello" && message.role === "confirm") {
+        connection.role = "confirm";
+        return { question: confirmQuestion };
+      }
+      if (message.type === "decision" && connection.role === "confirm") {
+        const resolve = resolveConfirm; resolveConfirm = null;
+        if (resolve) resolve(message.value === true);
+        return {};
+      }
       if (message.type === "hello") ready();
       if (message.type === "status" && launch.status !== "running") delivered();
       return { launch: { ...launch } };
     },
-    disconnect: () => delivered(),
+    disconnect(connection) {
+      if (connection.role === "confirm") {
+        const resolve = resolveConfirm; resolveConfirm = null;
+        if (resolve) resolve(false);
+        return;
+      }
+      delivered();
+    },
   });
+  const confirm = (question) => {
+    confirmQuestion = question;
+    return new Promise((resolve) => {
+      resolveConfirm = resolve;
+      try { openConfirmPopup(pipeName); }
+      catch { resolveConfirm = null; resolve(false); }
+    });
+  };
   let timer;
   try {
     openProgressPane(pipeName, context);
@@ -1417,7 +1515,7 @@ async function cleanup() {
       await runCleanup(context, async (step) => {
         launch.step = step;
         await new Promise((resolve) => setImmediate(resolve));
-      });
+      }, confirm);
       launch.status = "started";
     } catch (error) {
       launch.status = "failed";
@@ -1444,13 +1542,14 @@ async function main() {
   if (mode === "start") return controller(args[0]);
   if (mode === "popup") return popup();
   if (mode === "progress") return progress();
+  if (mode === "confirm") return confirmPane();
   if (mode === "cleanup") return cleanup();
   if (mode === "watch") return watcher(args[0]);
-  throw new Error("expected start, popup, progress, cleanup, or watch mode");
+  throw new Error("expected start, popup, progress, confirm, cleanup, or watch mode");
 }
 
-module.exports = { autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, configuredHarnesses, controllerProtocol, defaultHarnessKind,
-  harnessStartArgs, installedIntegrations, openInputPopup, openProgressPane,
+module.exports = { autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, configuredHarnesses, confirmView, controllerProtocol, defaultHarnessKind,
+  harnessStartArgs, installedIntegrations, openConfirmPopup, openInputPopup, openProgressPane,
   popupFields, popupInputKey, popupInputView, popupSelection, popupState,
   project,
   checksSummary, implementationPullRequest, isAgentPromptStalled, monitor, progressView, pullRequestReadiness, readPluginConfig, readPluginState, resolveRepository, sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands,

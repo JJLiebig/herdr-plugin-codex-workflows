@@ -27,7 +27,7 @@ function fixture(options = {}) {
   let archived = false, released = false;
   const workspace = { workspace_id: "w9", tokens: {
     workflow_kind: "issue", workflow_state: options.running ? "RUNNING" : "complete", workflow_controller: options.running ? "active" : "inactive",
-    workflow_branch: payload.branch, workflow_cleanup: "waiting",
+    workflow_branch: options.tokenBranch || payload.branch, workflow_cleanup: "waiting",
     workflow_root_pane: payload.rootPaneId, workflow_session: payload.sessionId,
     ...(options.running ? { workflow_controller_pipe: "\\\\.\\pipe\\herdr-codex-workflows-test" } : {}),
   }, worktree: { is_linked_worktree: true, checkout_path: payload.worktreePath, repo_root: payload.repoRoot } };
@@ -47,7 +47,7 @@ function fixture(options = {}) {
       if (args[0] === "remote") return "https://github.com/owner/repo.git";
       if (args[0] === "branch") return options.branch || payload.branch;
       if (args[0] === "status") return options.dirty || (archived && options.postDirty) || "";
-      return `worktree ${payload.repoRoot}\nbranch refs/heads/master\n\nworktree ${payload.worktreePath}\nbranch refs/heads/${payload.branch}\n`;
+      return `worktree ${payload.repoRoot}\nbranch refs/heads/master\n\nworktree ${payload.worktreePath}\nbranch refs/heads/${options.branch || payload.branch}\n`;
     },
     async pullRequest() { calls.push("pull"); return options.pull || { state: "MERGED", mergedAt: "2026-09-01T00:00:00Z" }; },
     async release() {
@@ -67,6 +67,7 @@ function fixture(options = {}) {
     Object.assign(workspace.tokens, { workflow_state: "cancelled", workflow_controller: "inactive", workflow_cleanup: "manual",
       workflow_root_pane: payload.rootPaneId, workflow_session: payload.sessionId });
   };
+  if (options.force) ops.force = true;
   ops.cleanup = async () => { calls.push("cleanup"); return cleanupTransaction(payload, ops); };
   return { calls, ops };
 }
@@ -133,12 +134,37 @@ test("detached watcher arms before authorization and IPC release", async () => {
   assert.deepEqual(order, ["armed", "authorize", "disconnect", "unref"]);
 });
 
-test("refuses concrete identity, dirty, and active-agent mismatches before archive", async () => {
-  for (const options of [{ branch: "other" }, { dirty: " M file" }, { active: true }, { rootReplacement: true }]) {
+test("refuses concrete identity and active-agent mismatches before archive", async () => {
+  for (const options of [{ active: true }, { rootReplacement: true }]) {
     const { calls, ops } = fixture(options);
     assert.equal((await cleanupTransaction(payload, ops)).status, "stopped");
     assert.equal(calls.includes("archive"), false);
   }
+});
+
+test("reports a dirty worktree instead of stopping, and removes it when forced", async () => {
+  const dirty = fixture({ dirty: " M file" });
+  assert.equal((await cleanupTransaction(payload, dirty.ops)).status, "dirty");
+  assert.equal(dirty.calls.includes("archive"), false);
+  const forced = fixture({ dirty: " M file", force: true });
+  assert.equal((await cleanupTransaction(payload, forced.ops)).status, "removed");
+  assert.equal(forced.calls.includes("archive"), true);
+  assert.equal(forced.calls.includes("remove"), true);
+  const postDirty = fixture({ postDirty: " M file", force: true });
+  assert.equal((await cleanupTransaction(payload, postDirty.ops)).status, "removed");
+});
+
+test("removes a verified workflow even after its worktree branch was repurposed", async () => {
+  const drifted = fixture({ branch: "pr-2179-rebased" });
+  assert.equal((await cleanupTransaction(payload, drifted.ops)).status, "removed");
+  assert.equal(drifted.calls.includes("archive"), true);
+  assert.equal(drifted.calls.includes("remove"), true);
+});
+
+test("refuses cleanup when the payload branch disagrees with the recorded workflow branch", async () => {
+  const changed = fixture({ tokenBranch: "auto-issue-9-other" });
+  assert.equal((await cleanupTransaction(payload, changed.ops)).status, "stopped");
+  assert.equal(changed.calls.includes("archive"), false);
 });
 
 test("waits for the exact owning agent to become idle before cleanup", async () => {

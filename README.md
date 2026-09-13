@@ -188,10 +188,15 @@ and worktree removal. Failures stay visible; focus the pane and press Enter,
 Escape, or Ctrl+C to close it. Successful removal closes the workspace and its
 progress pane. Closing the progress pane does not cancel cleanup.
 For an idle or waiting active workflow, it first
-cancels the controller. It refuses a changed identity, dirty worktree, working
-or changed agent, path outside
-`C:\Code\.worktrees`, or an ambiguous agent session. A finalize failure removes
-nothing; a failure after finalize keeps the worktree for manual inspection.
+cancels the controller. It refuses a changed identity, working or changed agent,
+path outside `C:\Code\.worktrees`, or an ambiguous agent session. A worktree
+whose branch was later repurposed (for example reused for a rebase) is still
+removable: the recorded workspace identity and the linked-worktree path
+establish ownership, and the branch itself is preserved. A dirty worktree opens
+a focused confirmation popup; choosing "remove it anyway" reruns the transaction
+and force-removes the checkout, while any other answer keeps it. A finalize
+failure removes nothing; a failure after finalize keeps the worktree for manual
+inspection.
 
 A Herdr or machine restart loses an active watcher. The plugin has no registry
 or startup recovery and does not reconstruct the wait after restart. Use the

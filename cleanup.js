@@ -115,7 +115,7 @@ function classifyPullRequest(value) {
   return "retry";
 }
 
-function assertLocalIdentity(payload, snapshot, allowOwner = false, allowRunning = false) {
+function assertLocalIdentity(payload, snapshot, allowOwner = false, allowRunning = false, allowDirty = false) {
   const workspace = snapshot.workspace;
   if (!workspace) return false;
   const worktree = workspace.worktree, tokens = workspace.tokens || {};
@@ -143,9 +143,17 @@ function assertLocalIdentity(payload, snapshot, allowOwner = false, allowRunning
   const repoName = payload.repo.split("/")[1];
   const expectedRoot = normalizePath(path.join(WORKTREE_ROOT, repoName));
   if (!normalizePath(payload.worktreePath).startsWith(`${expectedRoot}${path.sep}`)) throw new CleanupStop("workflow worktree is outside the managed root");
-  if (snapshot.repo !== payload.repo || snapshot.branch !== payload.branch || snapshot.status) throw new CleanupStop(snapshot.status ? "workflow worktree has uncommitted changes" : "Git identity changed");
+  if (snapshot.repo !== payload.repo) throw new CleanupStop("Git identity changed");
+  if (snapshot.status && !allowDirty) {
+    const error = new CleanupStop("workflow worktree has uncommitted changes");
+    error.dirty = true;
+    throw error;
+  }
+  // The checkout may have been repurposed onto another branch after the workflow
+  // finished. The recorded workspace identity and the linked-worktree path prove
+  // ownership; a clean checkout is safe to remove because its branch survives.
   const mapping = parseWorktreeList(snapshot.worktrees).filter((item) => normalizePath(item.path) === normalizePath(payload.worktreePath));
-  if (mapping.length !== 1 || mapping[0].branch !== payload.branch) throw new CleanupStop("Git worktree mapping changed");
+  if (mapping.length !== 1) throw new CleanupStop("Git worktree mapping changed");
   return true;
 }
 
@@ -162,9 +170,9 @@ async function snapshot(payload, ops) {
   };
 }
 
-async function preflight(payload, ops, allowOwner = false, allowRunning = false) {
+async function preflight(payload, ops, allowOwner = false, allowRunning = false, allowDirty = false) {
   payload = validatePayload(payload);
-  return assertLocalIdentity(payload, await snapshot(payload, ops), allowOwner, allowRunning);
+  return assertLocalIdentity(payload, await snapshot(payload, ops), allowOwner, allowRunning, allowDirty);
 }
 
 async function withCleanupClaim(payload, callback) {
@@ -189,10 +197,12 @@ async function cleanupTransaction(payload, ops, claimed = false) {
   payload = validatePayload(payload);
   if (!claimed) return withCleanupClaim(payload, () => cleanupTransaction(payload, ops, true));
   const abandon = typeof ops.abandon === "function";
+  const force = ops.force === true;
   try {
     await ops.progress?.(0);
-    if (!await preflight(payload, ops, true, abandon)) return { status: "missing" };
+    if (!await preflight(payload, ops, true, abandon, force)) return { status: "missing" };
   } catch (error) {
+    if (error.dirty) return { status: "dirty", reason: safeReason(error, "workflow worktree has uncommitted changes") };
     if (error.retryable) return { status: "retry", reason: safeReason(error, "Owning agent session is still active.") };
     return { status: "stopped", reason: safeReason(error, "Cleanup preflight failed; the workspace was retained.") };
   }
@@ -213,7 +223,7 @@ async function cleanupTransaction(payload, ops, claimed = false) {
   try {
     await ops.progress?.(3);
     const after = await snapshot(payload, ops);
-    if (!assertLocalIdentity(payload, after, false)) throw new CleanupStop("workspace disappeared after session archive");
+    if (!assertLocalIdentity(payload, after, false, false, force)) throw new CleanupStop("workspace disappeared after session archive");
   } catch (error) {
     return { status: "partial", reason: safeReason(error, "Post-archive validation failed; the worktree was retained.") };
   }
