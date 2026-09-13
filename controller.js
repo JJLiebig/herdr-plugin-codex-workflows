@@ -296,7 +296,7 @@ function pullRequestReadiness(data) {
 function pullRequest(repository, number) {
   const data = readJson(execute(gh, [
     "pr", "view", String(number), "--repo", repository.repo,
-    "--json", "number,url,baseRefName,baseRefOid,headRefOid,headRefName,headRepository,isCrossRepository,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision",
+    "--json", "number,url,baseRefName,baseRefOid,headRefOid,headRefName,headRepository,isCrossRepository,maintainerCanModify,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision",
   ]));
   if (!data?.headRefOid || !data?.baseRefOid || !data?.headRefName || Number(data.number) !== number) {
     throw new Error("GitHub did not return exact pull-request identities");
@@ -316,6 +316,7 @@ function pullRequest(repository, number) {
     headRefName: data.headRefName,
     headRepository: data.headRepository?.nameWithOwner || null,
     crossRepository: data.isCrossRepository === true,
+    maintainerCanModify: data.maintainerCanModify === true,
     readiness: pullRequestReadiness(data),
   };
 }

@@ -110,11 +110,13 @@ agent to bring the existing pull request to a mergeable state: validate and sign
 off when it is already green and approved, or take over — rebase, resolve
 conflicts, fix failing checks, and address open review findings — when it is not.
 The controller injects a launch summary (mergeability, check counts, review
-decision) and the agent re-checks with the GitHub CLI. Missing required human
-review is reported as the remaining step rather than self-approved. A custom
-instruction such as "review only" keeps the agent strictly read-only. The prompt
-is chosen per harness; Codex uses the Ponytail and Review Suite skills, opencode
-uses a harness-neutral prompt.
+decision) and the agent re-checks with the GitHub CLI. It updates the existing
+pull request in place, including a fork that allows maintainer edits; only a head
+the agent cannot push to prompts a replacement pull request, and only after
+asking. Missing required human review is reported as the remaining step rather
+than self-approved. A custom instruction such as "review only" keeps the agent
+strictly read-only. The prompt is chosen per harness; Codex uses the Ponytail and
+Review Suite skills, opencode uses a harness-neutral prompt.
 
 `feature-to-pr` uses the current repository. Its single multiline field accepts
 the feature or fix description. Enter starts the workflow; Shift+Enter adds a line.

@@ -192,12 +192,21 @@ test("shepherding prompt injects readiness, fork gate, and push target", () => {
 
   const fork = prPrompt({
     repo: "owner/repo", prUrl: "https://github.com/owner/repo/pull/8",
-    headRefName: "fix/y", headRepository: "someone/repo", crossRepository: true,
+    headRefName: "fix/y", headRepository: "someone/repo", crossRepository: true, maintainerCanModify: false,
     readiness: null, instructions: "",
   });
-  assert.match(fork, /If the head is in a fork, stop and ask/);
+  assert.match(fork, /does not allow maintainer edits\. Stop and ask before changing anything/);
+  assert.match(fork, /push a new branch and open a replacement pull request that preserves/);
   assert.match(fork, /only if you can push to it; otherwise stop and ask/);
-  assert.match(fork, /only open a replacement pull request when the head is in a fork/);
+
+  const editableFork = prPrompt({
+    repo: "owner/repo", prUrl: "https://github.com/owner/repo/pull/9",
+    headRefName: "fix/z", headRepository: "someone/repo", crossRepository: true, maintainerCanModify: true,
+    readiness: null, instructions: "",
+  });
+  assert.match(editableFork, /allows maintainer edits; update the existing pull request in place/);
+  assert.match(editableFork, /maintainer edits are allowed, so add the fork as a remote and push there/);
+  assert.doesNotMatch(editableFork, /open a replacement pull request that preserves/);
 });
 
 test("classifies pull-request checks and tracks the workflow pull request", () => {

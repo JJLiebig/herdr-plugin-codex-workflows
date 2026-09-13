@@ -22,7 +22,18 @@ function pushTarget(input) {
   const fork = input.headRepository
     ? `${input.headRepository}${input.headRefName ? `/${input.headRefName}` : ""}`
     : "the fork head";
-  return `the fork head ${fork} only if you can push to it; otherwise stop and ask`;
+  return input.maintainerCanModify
+    ? `the existing head branch in ${fork} (maintainer edits are allowed, so add the fork as a remote and push there)`
+    : `the fork head ${fork} only if you can push to it; otherwise stop and ask`;
+}
+
+function headAccess(input) {
+  if (!input.crossRepository) {
+    return `The head is this repository's own branch${input.headRefName ? ` \`${input.headRefName}\`` : ""}; update the existing pull request in place.`;
+  }
+  const fork = input.headRepository || "a fork";
+  if (input.maintainerCanModify) return `The head is a fork (${fork}) that allows maintainer edits; update the existing pull request in place.`;
+  return `The head is a fork (${fork}) that does not allow maintainer edits. Stop and ask before changing anything; only if told to proceed, push a new branch and open a replacement pull request that preserves the original commit authorship.`;
 }
 
 function issuePrompt(input) {
@@ -55,7 +66,7 @@ function prPrompt(input) {
   return `You are bringing pull request ${input.prUrl} on repository ${input.repo} to a mergeable state, keeping the work on the existing pull request.
 
 1. Inspect the complete pull request before editing: description, commits, diff, mergeability, checks, reviews, open review comments (including unresolved Greptile/CodeRabbit comments), and whether it is behind its base. Re-check with the GitHub CLI; treat the launch state below as a starting point only.
-${readinessSummary(input)}2. If the head is in a fork, stop and ask before changing anything. If told to proceed, push a new branch and open a replacement pull request that preserves the original commit authorship.
+${readinessSummary(input)}2. ${headAccess(input)}
 3. Classify and act:
    - Behind its base and rebasing cleanly: rebase onto the current base.
    - Rebase conflicts, failing checks, unresolved review findings, or conflicts introduced by the pull request: take over — triage and resolve conflicts, and fix only what is required to make it mergeable, keeping changes in the spirit of the pull request.
@@ -63,7 +74,7 @@ ${readinessSummary(input)}2. If the head is in a fork, stop and ask before chang
    - Required human review missing: make the change code-complete and report that a human reviewer is the remaining step; never claim you approved it.
    - Already green, approved, and current: validate and sign off without changing code.
 4. If your changes materially alter the diff, run $ponytail:ponytail-review once, then $review-suite:review (note: herdrdev/herdr uses mode fast). A mechanical rebase or trivial fix does not need them.
-5. Push to ${pushTarget(input)}. Do not merge; only open a replacement pull request when the head is in a fork and the user approved it. Handle CI and any automated reviewers present; verify findings and reply to every addressed inline comment.
+5. Push to ${pushTarget(input)}. Do not merge; open a replacement pull request only when you cannot push to the existing head and the user approved it. Handle CI and any automated reviewers present; verify findings and reply to every addressed inline comment.
 6. When the custom instructions ask for review only or no changes, stay strictly read-only.
 7. Leave a concise recap: the classification, what you changed, validation, the pull-request URL, and anything that still needs a human decision.
 ${customInstructions(input)}`;
@@ -99,7 +110,7 @@ function opencodePrPrompt(input) {
   return `You are bringing pull request ${input.prUrl} on repository ${input.repo} to a mergeable state, keeping the work on the existing pull request.
 
 1. Inspect the complete pull request before editing: description, commits, diff, mergeability, checks, reviews, open review comments (including unresolved automated-reviewer comments), and whether it is behind its base. Re-check with the GitHub CLI; treat the launch state below as a starting point only.
-${readinessSummary(input)}2. If the head is in a fork, stop and ask before changing anything. If told to proceed, push a new branch and open a replacement pull request that preserves the original commit authorship.
+${readinessSummary(input)}2. ${headAccess(input)}
 3. Classify and act:
    - Behind its base and rebasing cleanly: rebase onto the current base.
    - Rebase conflicts, failing checks, unresolved review findings, or conflicts introduced by the pull request: take over — triage and resolve conflicts, and fix only what is required to make it mergeable, keeping changes in the spirit of the pull request.
@@ -107,7 +118,7 @@ ${readinessSummary(input)}2. If the head is in a fork, stop and ask before chang
    - Required human review missing: make the change code-complete and report that a human reviewer is the remaining step; never claim you approved it.
    - Already green, approved, and current: validate and sign off without changing code.
 4. Keep the diff minimal and avoid unrelated changes.
-5. Push to ${pushTarget(input)}. Do not merge; only open a replacement pull request when the head is in a fork and the user approved it. Handle CI and any automated reviewers present; verify findings and reply to every addressed inline comment.
+5. Push to ${pushTarget(input)}. Do not merge; open a replacement pull request only when you cannot push to the existing head and the user approved it. Handle CI and any automated reviewers present; verify findings and reply to every addressed inline comment.
 6. When the custom instructions ask for review only or no changes, stay strictly read-only.
 7. Leave a concise recap: the classification, what you changed, validation, the pull-request URL, and anything that still needs a human decision.
 ${customInstructions(input)}`;
