@@ -236,6 +236,9 @@ test("cleans harness decoration from session titles", () => {
   assert.equal(agentSessionTitle({ terminal_title_stripped: "" }, getHarness("codex")), "");
   assert.equal(agentSessionTitle({}, getHarness("codex")), "");
   assert.equal([...agentSessionTitle({ terminal_title_stripped: "y".repeat(80) }, null)].length, 40);
+  assert.equal(agentSessionTitle({ terminal_title_stripped: "OC | OpenCode" }, getHarness("opencode")), "");
+  assert.equal(agentSessionTitle({ terminal_title_stripped: "task-1e5f3b | codex", cwd: "C:\\Code\\.worktrees\\herdr\\task-1e5f3b" }, getHarness("codex")), "");
+  assert.equal(agentSessionTitle({ terminal_title_stripped: "cw-1e5f3b", name: "cw-1e5f3b" }, getHarness("opencode")), "");
 });
 
 test("project names the workspace and pane from the session title", () => {

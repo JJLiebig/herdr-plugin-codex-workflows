@@ -411,14 +411,17 @@ function agentSessionTitle(agent, harness) {
   // no whitespace is decoration rather than part of the session title.
   while (parts.length > 1 && (isTag(parts[parts.length - 1]) || !/\s/.test(parts[parts.length - 1]))) parts.pop();
   const title = compact(parts.join(" | "));
+  // Harnesses report a bare harness name or the working-directory name until a
+  // real session title exists; never adopt those as the label.
+  if (!title || isTag(title)
+    || (agent?.name && title.toLowerCase() === String(agent.name).toLowerCase())
+    || (agent?.cwd && title.toLowerCase() === path.basename(agent.cwd).toLowerCase())) return "";
   return [...title].length > 40 ? `${[...title].slice(0, 39).join("")}…` : title;
 }
 
 function displayLabel(runtime, agent) {
-  if (!runtime.label) {
-    const title = agentSessionTitle(agent, runtime.harness);
-    if (title) runtime.label = title;
-  }
+  const title = agentSessionTitle(agent, runtime.harness);
+  if (title) runtime.label = title;
   return runtime.label || runtime.identity.shortLabel;
 }
 
@@ -803,7 +806,8 @@ async function monitor(runtime, repository, operations = {}) {
       runtime.terminal = { type: "terminal", status: "cancelled", reason: "workflow workspace was closed" };
     }
     const agent = agentByName(runtime.identity.agentName);
-    if (!runtime.terminal && agent?.agent_session && (!runtime.identitySaved || (!runtime.label && agentSessionTitle(agent, runtime.harness)))) updateProject(runtime, lastProjection);
+    const agentTitle = agent ? agentSessionTitle(agent, runtime.harness) : "";
+    if (!runtime.terminal && agent?.agent_session && (!runtime.identitySaved || (agentTitle && agentTitle !== runtime.label))) updateProject(runtime, lastProjection);
     if (runtime.terminal) {
       runtime.lifecycle.transition("cancel");
       updateTerminal(runtime, runtime.terminal, agent);
