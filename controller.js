@@ -370,7 +370,10 @@ function captureWorkflowIdentity(runtime, save = saveWorkflowIdentity) {
 
 async function restoreWorkflowIdentity(workspace) {
   if (!workspace.worktree?.is_linked_worktree || workspace.tokens?.workflow_kind) return;
-  const identity = readWorkflowIdentity(git(workspace.worktree.checkout_path, ["rev-parse", "--absolute-git-dir"]));
+  let gitDir;
+  try { gitDir = git(workspace.worktree.checkout_path, ["rev-parse", "--absolute-git-dir"]); }
+  catch { return; }
+  const identity = readWorkflowIdentity(gitDir);
   if (!identity) return;
   // Validate the stored identity before probing its controller pipe.
   recoveredWorkspace(workspace, identity, true);
@@ -652,7 +655,19 @@ function cleanupOps(workspaceId, abandon, harness = getHarness(DEFAULT_HARNESS),
     archive: async (sessionId) => {
       if (harness.archiveArgs) runHarness(harness, harness.archiveArgs(sessionId));
     },
-    remove: async (workspaceId) => runHerdr(["worktree", "remove", "--workspace", workspaceId, ...(force ? ["--force"] : [])]),
+    remove: async (workspaceId) => {
+      const checkout = getWorkspace(workspaceId)?.worktree?.checkout_path;
+      if (checkout && !succeeds(gitBin, ["-C", checkout, "rev-parse", "--git-dir"])) {
+        // The Git registration was pruned after the workflow finished; close the
+        // workspace and clear the leftover directory instead.
+        const leftover = fs.existsSync(checkout) ? fs.readdirSync(checkout) : [];
+        if (leftover.length) throw new Error(`worktree directory is not empty: ${checkout}`);
+        runHerdr(["workspace", "close", workspaceId]);
+        if (fs.existsSync(checkout)) fs.rmdirSync(checkout);
+        return;
+      }
+      runHerdr(["worktree", "remove", "--workspace", workspaceId, ...(force ? ["--force"] : [])]);
+    },
     cleanup: async () => (await cleanupCurrentWorkflow(workspaceId)).result,
     project: async (state) => projectCleanup(workspaceId, state),
     merged: async (workspace) => {
@@ -697,12 +712,19 @@ async function cleanupCurrentWorkflow(workspaceId, progress, confirm) {
   const harness = getHarness(workspace.tokens?.workflow_harness) || getHarness(DEFAULT_HARNESS);
   const { worktree, tokens } = manualWorkspace(workspace, listAgents(), harness);
   const abandon = tokens.workflow_state === "RUNNING";
-  const branch = tokens.workflow_branch || git(worktree.checkout_path, ["branch", "--show-current"]);
+  // A checkout can be pruned after the workflow finishes. Herdr metadata still
+  // owns the workspace, so use the main checkout for identity and let the
+  // transaction clear the leftover directory.
+  const orphaned = !succeeds(gitBin, ["-C", worktree.checkout_path, "rev-parse", "--git-dir"]);
+  const branch = tokens.workflow_branch || (orphaned ? "" : git(worktree.checkout_path, ["branch", "--show-current"]));
+  if (!branch) throw new Error("cleanup could not determine the workflow branch");
+  let repo;
+  try { repo = parseGitHubRemote(git(worktree.repo_root, ["remote", "get-url", "origin"])); }
+  catch { throw new Error("cleanup could not determine the repository from the workspace checkout"); }
   const payload = {
     version: 1, workflow: tokens.workflow_kind, harness: harness.kind, workspaceId,
     rootPaneId: tokens.workflow_root_pane, worktreePath: worktree.checkout_path, repoRoot: worktree.repo_root,
-    repo: parseGitHubRemote(git(worktree.checkout_path, ["remote", "get-url", "origin"])),
-    branch, sessionId: tokens.workflow_session, prNumber: null,
+    repo, branch, sessionId: tokens.workflow_session, prNumber: null,
   };
   const attempt = (force) => withCleanupClaim(payload, async () => {
     if (!abandon) projectCleanup(workspaceId, "manual");

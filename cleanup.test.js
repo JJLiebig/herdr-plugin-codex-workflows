@@ -44,6 +44,7 @@ function fixture(options = {}) {
       return options.noOwner ? [] : [agent()];
     },
     async git(_cwd, args) {
+      if (options.orphaned && _cwd === payload.worktreePath) throw new Error("not a git repository");
       if (args[0] === "remote") return "https://github.com/owner/repo.git";
       if (args[0] === "branch") return options.branch || payload.branch;
       if (args[0] === "status") return options.dirty || (archived && options.postDirty) || "";
@@ -165,6 +166,14 @@ test("refuses cleanup when the payload branch disagrees with the recorded workfl
   const changed = fixture({ tokenBranch: "auto-issue-9-other" });
   assert.equal((await cleanupTransaction(payload, changed.ops)).status, "stopped");
   assert.equal(changed.calls.includes("archive"), false);
+});
+
+test("cleans up a workspace whose worktree was pruned", async () => {
+  const { calls, ops } = fixture({ orphaned: true });
+  assert.deepEqual(await cleanupTransaction(payload, ops), { status: "removed" });
+  assert.equal(calls.includes("release"), true);
+  assert.equal(calls.includes("archive"), true);
+  assert.equal(calls.includes("remove"), true);
 });
 
 test("waits for the exact owning agent to become idle before cleanup", async () => {

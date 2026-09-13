@@ -143,6 +143,7 @@ function assertLocalIdentity(payload, snapshot, allowOwner = false, allowRunning
   const repoName = payload.repo.split("/")[1];
   const expectedRoot = normalizePath(path.join(WORKTREE_ROOT, repoName));
   if (!normalizePath(payload.worktreePath).startsWith(`${expectedRoot}${path.sep}`)) throw new CleanupStop("workflow worktree is outside the managed root");
+  if (snapshot.orphaned) return true;
   if (snapshot.repo !== payload.repo) throw new CleanupStop("Git identity changed");
   if (snapshot.status && !allowDirty) {
     const error = new CleanupStop("workflow worktree has uncommitted changes");
@@ -160,14 +161,18 @@ function assertLocalIdentity(payload, snapshot, allowOwner = false, allowRunning
 async function snapshot(payload, ops) {
   const workspace = await ops.workspace(payload.workspaceId);
   if (!workspace) return { workspace: null };
-  return {
-    workspace,
-    repo: parseGitHubRemote(await ops.git(payload.worktreePath, ["remote", "get-url", "origin"])),
-    branch: await ops.git(payload.worktreePath, ["branch", "--show-current"]),
-    status: await ops.git(payload.worktreePath, ["status", "--porcelain"]),
-    worktrees: await ops.git(payload.repoRoot, ["worktree", "list", "--porcelain"]),
-    agents: await ops.agents(),
-  };
+  const agents = await ops.agents();
+  try {
+    const repo = parseGitHubRemote(await ops.git(payload.worktreePath, ["remote", "get-url", "origin"]));
+    const branch = await ops.git(payload.worktreePath, ["branch", "--show-current"]);
+    const status = await ops.git(payload.worktreePath, ["status", "--porcelain"]);
+    const worktrees = await ops.git(payload.repoRoot, ["worktree", "list", "--porcelain"]);
+    return { workspace, repo, branch, status, worktrees, agents };
+  } catch {
+    // The checkout was pruned or removed. Herdr metadata still proves ownership,
+    // so cleanup proceeds without Git identity checks and clears the leftovers.
+    return { workspace, orphaned: true, agents };
+  }
 }
 
 async function preflight(payload, ops, allowOwner = false, allowRunning = false, allowDirty = false) {
