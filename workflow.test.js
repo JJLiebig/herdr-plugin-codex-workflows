@@ -7,10 +7,10 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {
-  autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, controllerProtocol, defaultHarnessKind, harnessStartArgs, installedIntegrations, openInputPopup,
+  autoCleanupOnPrMerge, canonicalRepositoryRoot, checksSummary, codexAgentStartArgs, completeGitHubTarget, controllerProtocol, defaultHarnessKind, harnessStartArgs, installedIntegrations, openInputPopup,
   project,
-  implementationPullRequest, isAgentPromptStalled, monitor, openProgressPane, popupFields, popupInputKey, popupInputView, popupSelection, popupState, progressView, readPluginState, resolveRepository,
-  sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands, waitForActivity, writePluginState,
+  implementationPullRequest, isAgentPromptStalled, monitor, openProgressPane, popupFields, popupInputKey, popupInputView, popupSelection, popupState, progressView, pullRequestReadiness, readPluginState, resolveRepository,
+  sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands, trackedPullRequest, waitForActivity, writePluginState,
 } = require("./controller.js");
 const { issuePrompt, prPrompt, taskPrompt, opencodeIssuePrompt } = require("./prompts.js");
 const { getHarness, harnessList, sessionMatches } = require("./harnesses.js");
@@ -166,6 +166,55 @@ test("popup edits and renders multiline custom instructions", () => {
   assert.doesNotMatch(issuePrompt({ ...promptInput, instructions: "" }), /Custom Instructions/);
   assert.match(issuePrompt(promptInput), /\$review-suite:review \(note: herdrdev\/herdr uses mode fast\)/);
   assert.match(prPrompt(promptInput), /\$review-suite:review \(note: herdrdev\/herdr uses mode fast\)/);
+});
+
+test("shepherding prompt injects readiness, fork gate, and push target", () => {
+  const sameRepo = prPrompt({
+    repo: "owner/repo", prUrl: "https://github.com/owner/repo/pull/7",
+    headRefName: "fix/x", headRepository: "owner/repo", crossRepository: false,
+    readiness: { mergeable: "MERGEABLE", mergeStateStatus: "BEHIND", reviewDecision: "APPROVED", checks: { passing: 3, pending: 1, failing: 0 } },
+    instructions: "",
+  });
+  assert.match(sameRepo, /checks 3 passing \/ 1 pending \/ 0 failing, review approved/);
+  assert.match(sameRepo, /git push origin HEAD:fix\/x/);
+  assert.doesNotMatch(sameRepo, /AGENTS\.md/);
+
+  const fork = prPrompt({
+    repo: "owner/repo", prUrl: "https://github.com/owner/repo/pull/8",
+    headRefName: "fix/y", headRepository: "someone/repo", crossRepository: true,
+    readiness: null, instructions: "",
+  });
+  assert.match(fork, /If the head is in a fork, stop and ask/);
+  assert.match(fork, /only if you can push to it; otherwise stop and ask/);
+  assert.match(fork, /only open a replacement pull request when the head is in a fork/);
+});
+
+test("classifies pull-request checks and tracks the workflow pull request", () => {
+  assert.deepEqual(checksSummary([
+    { name: "a", status: "COMPLETED", conclusion: "SUCCESS" },
+    { name: "b", status: "IN_PROGRESS", conclusion: "" },
+    { name: "c", status: "COMPLETED", conclusion: "FAILURE" },
+    { name: "d", state: "PENDING" },
+    { name: "e", state: "SUCCESS" },
+    { name: "f", state: "ERROR" },
+  ]), { passing: 2, pending: 2, failing: 2 });
+  assert.deepEqual(pullRequestReadiness({
+    mergeable: "CONFLICTING", mergeStateStatus: "DIRTY", reviewDecision: "REVIEW_REQUIRED",
+    statusCheckRollup: [{ status: "COMPLETED", conclusion: "SUCCESS" }],
+  }), {
+    mergeable: "CONFLICTING", mergeStateStatus: "DIRTY", reviewDecision: "REVIEW_REQUIRED",
+    checks: { passing: 1, pending: 0, failing: 0 },
+  });
+  assert.equal(pullRequestReadiness({}).checks.pending, 0);
+
+  const runtime = { identity: { branch: "auto-pr-7-abc123" }, prNumber: 7, prUrl: "https://github.com/owner/repo/pull/7" };
+  assert.deepEqual(trackedPullRequest(runtime, { repo: "owner/repo" }, []), { number: 7, url: runtime.prUrl });
+  assert.deepEqual(trackedPullRequest(runtime, { repo: "owner/repo" }, [{ number: 9, url: "replacement" }]), { number: 9, url: "replacement" });
+  assert.throws(() => trackedPullRequest(runtime, { repo: "owner/repo" }, [{}, {}]), /multiple open pull requests/);
+});
+
+test("pull-request identity uses the shepherding branch stem", () => {
+  assert.match(makeIdentity("pr", { number: 7 }, "abcdef123456").branch, /^auto-pr-7-abcdef12-[0-9a-f]{6}$/);
 });
 
 test("popup selects a harness with the arrow keys and type-ahead", () => {

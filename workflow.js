@@ -56,7 +56,7 @@ function parseSameRepositoryPullRequest(raw, repo) {
 function makeIdentity(workflow, target = {}, headSha = "") {
   const nonce = crypto.randomBytes(3).toString("hex");
   const stem = workflow === "pr"
-    ? `review-pr-${target.number}-${headSha.slice(0, 8)}`
+    ? `pr-${target.number}-${headSha.slice(0, 8)}`
     : workflow === "issue" ? `issue-${target.number}` : "task";
   return {
     branch: `auto-${stem}-${nonce}`,

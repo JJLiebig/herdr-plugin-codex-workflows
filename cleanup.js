@@ -47,7 +47,7 @@ function validatePayload(value) {
   const harness = getHarness(value?.harness) || getHarness(DEFAULT_HARNESS);
   if (!value || value.version !== 1 || !WORKFLOW_KINDS.has(value.workflow)
     || !value.workspaceId || !value.rootPaneId || !value.worktreePath || !value.repoRoot
-    || !/^[^/\s]+\/[^/\s]+$/.test(value.repo) || !/^(?:codex\/|auto-)(?:issue|review-pr|task)-/.test(value.branch) || !harness.sessionValue(value.sessionId)
+    || !/^[^/\s]+\/[^/\s]+$/.test(value.repo) || !/^(?:codex\/|auto-)(?:issue|pr|review-pr|task)-/.test(value.branch) || !harness.sessionValue(value.sessionId)
     || (value.prNumber !== null && (!Number.isSafeInteger(value.prNumber) || value.prNumber < 1))) {
     throw new Error("invalid cleanup watcher payload");
   }

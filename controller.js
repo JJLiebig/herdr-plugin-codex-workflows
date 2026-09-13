@@ -263,12 +263,42 @@ function completeGitHubTarget(target, data) {
   return { ...target, type: data.pull_request ? "pr" : "issue", url: data.html_url };
 }
 
+function checksSummary(rollup) {
+  const summary = { passing: 0, pending: 0, failing: 0 };
+  for (const check of Array.isArray(rollup) ? rollup : []) {
+    const state = String(check?.state || "").toUpperCase();
+    const status = String(check?.status || "").toUpperCase();
+    const conclusion = String(check?.conclusion || "").toUpperCase();
+    if (state && !status) {
+      if (["SUCCESS", "NEUTRAL", "SKIPPED"].includes(state)) summary.passing += 1;
+      else if (["PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS"].includes(state)) summary.pending += 1;
+      else summary.failing += 1;
+    } else if (status !== "COMPLETED") {
+      summary.pending += 1;
+    } else if (["SUCCESS", "NEUTRAL", "SKIPPED"].includes(conclusion)) {
+      summary.passing += 1;
+    } else {
+      summary.failing += 1;
+    }
+  }
+  return summary;
+}
+
+function pullRequestReadiness(data) {
+  return {
+    mergeable: data.mergeable || null,
+    mergeStateStatus: data.mergeStateStatus || null,
+    reviewDecision: data.reviewDecision || null,
+    checks: checksSummary(data.statusCheckRollup),
+  };
+}
+
 function pullRequest(repository, number) {
   const data = readJson(execute(gh, [
     "pr", "view", String(number), "--repo", repository.repo,
-    "--json", "number,url,baseRefName,baseRefOid,headRefOid",
+    "--json", "number,url,baseRefName,baseRefOid,headRefOid,headRefName,headRepository,isCrossRepository,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision",
   ]));
-  if (!data?.headRefOid || !data?.baseRefOid || Number(data.number) !== number) {
+  if (!data?.headRefOid || !data?.baseRefOid || !data?.headRefName || Number(data.number) !== number) {
     throw new Error("GitHub did not return exact pull-request identities");
   }
   const fetchedBase = fetchPinned(repository, data.baseRefOid);
@@ -283,13 +313,11 @@ function pullRequest(repository, number) {
     baseBranch: data.baseRefName,
     baseSha: data.baseRefOid,
     headSha: data.headRefOid,
+    headRefName: data.headRefName,
+    headRepository: data.headRepository?.nameWithOwner || null,
+    crossRepository: data.isCrossRepository === true,
+    readiness: pullRequestReadiness(data),
   };
-}
-
-function currentPullRequestHead(repository, number) {
-  const value = readJson(execute(gh, ["pr", "view", String(number), "--repo", repository.repo, "--json", "headRefOid"]));
-  if (!value?.headRefOid) throw new Error("GitHub did not return the current pull-request head");
-  return value.headRefOid;
 }
 function assertNoCollision(repository, branch, worktree) {
   const herdrWorktrees = runHerdrJson(["worktree", "list", "--cwd", repository.root])?.result?.worktrees || [];
@@ -413,8 +441,7 @@ function projectTerminal(runtime, report, candidate = getAgent(runtime.identity.
   try { owner = candidate && matchingSession([candidate], workspaceId, paneId, runtime.harness); } catch {}
   if (owner && !runtime.ownerSessionId) runtime.ownerSessionId = owner.agent_session.value;
   captureWorkflowIdentity(runtime);
-  const stale = runtime.workflow === "pr" && report.status === "complete" && report["reviewed-head"].toLowerCase() !== report["current-head"].toLowerCase();
-  const resultText = report.status === "complete" ? (stale ? "complete · head changed" : isImplementationWorkflow(runtime.workflow) ? "complete · PR open" : "complete") : report.status;
+  const resultText = report.status === "complete" ? (isImplementationWorkflow(runtime.workflow) ? "complete · PR open" : "complete") : report.status;
   try {
     runHerdr(["workspace", "rename", workspaceId, `[${runtime.identity.shortLabel}] ${resultText}`]);
     runHerdr([
@@ -712,11 +739,20 @@ function implementationPullRequest(runtime, repository, matches = readJson(execu
   return pullRequest;
 }
 
+function trackedPullRequest(runtime, repository, matches = readJson(execute(gh, [
+    "pr", "list", "--repo", repository.repo, "--head", runtime.identity.branch, "--state", "open",
+    "--json", "number,url",
+  ]), [])) {
+  if (matches.length > 1) throw new Error(`${harnessLabel(runtime)} left multiple open pull requests for the workflow branch`);
+  if (matches.length === 1) return matches[0];
+  return runtime.prUrl ? { number: runtime.prNumber, url: runtime.prUrl } : null;
+}
+
 async function monitor(runtime, repository, operations = {}) {
   const workspace = operations.workspace || getWorkspace;
   const agentByName = operations.agent || getAgent;
   const findImplementationPullRequest = operations.implementationPullRequest || implementationPullRequest;
-  const currentHead = operations.currentPullRequestHead || currentPullRequestHead;
+  const findTrackedPullRequest = operations.trackedPullRequest || trackedPullRequest;
   const updateProject = operations.project || project;
   const updateTerminal = operations.projectTerminal || projectTerminal;
   const activity = operations.activity || waitForActivity;
@@ -762,8 +798,14 @@ async function monitor(runtime, repository, operations = {}) {
         runtime.prNumber = Number(pullRequest.number);
         runtime.terminal = { type: "terminal", status: "complete", "pr-url": pullRequest.url, "head-sha": pullRequest.headRefOid };
       } else {
-        runtime.terminal = { type: "terminal", status: "complete", "reviewed-head": runtime.headSha,
-          "current-head": currentHead(repository, runtime.prNumber) };
+        const pullRequest = findTrackedPullRequest(runtime, repository);
+        if (!pullRequest) {
+          updateProject(runtime, "waiting");
+          lastProjection = "waiting";
+          continue;
+        }
+        runtime.prNumber = Number(pullRequest.number);
+        runtime.terminal = { type: "terminal", status: "complete", "pr-url": pullRequest.url };
       }
       runtime.lifecycle.transition("complete");
       updateTerminal(runtime, runtime.terminal, agent);
@@ -930,7 +972,7 @@ async function controller(mode = "github") {
     } else {
       details = pullRequest(repository, target.number);
       identity = makeIdentity(runtime.workflow, target, details.headSha);
-      runtime.prNumber = details.prNumber; runtime.headSha = details.headSha;
+      runtime.prNumber = details.prNumber; runtime.prUrl = details.prUrl;
     }
     runtime.identity = identity; runtime.baseBranch = details.baseBranch; runtime.baseSha = details.baseSha;
     runtime.launch.step = 2;
@@ -1411,8 +1453,8 @@ module.exports = { autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStar
   harnessStartArgs, installedIntegrations, openInputPopup, openProgressPane,
   popupFields, popupInputKey, popupInputView, popupSelection, popupState,
   project,
-  implementationPullRequest, isAgentPromptStalled, monitor, progressView, readPluginConfig, readPluginState, resolveRepository, sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands,
-  waitForActivity, writePluginState };
+  checksSummary, implementationPullRequest, isAgentPromptStalled, monitor, progressView, pullRequestReadiness, readPluginConfig, readPluginState, resolveRepository, sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands,
+  trackedPullRequest, waitForActivity, writePluginState };
 
 if (require.main === module) {
   main().catch((error) => {

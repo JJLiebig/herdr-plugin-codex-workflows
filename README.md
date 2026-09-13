@@ -1,9 +1,10 @@
 # Herdr Agent Workflows
 
 Windows-only Herdr actions for turning a feature request or issue into an open
-pull request, or understanding an existing pull request in an isolated agent
-workspace. Supports every Herdr agent kind that reports a stable session, and
-is built around per-harness adapters so new kinds are a one-line addition.
+pull request, or shepherding an existing pull request to a mergeable state in an
+isolated agent workspace. Supports every Herdr agent kind that reports a stable
+session, and is built around per-harness adapters so new kinds are a one-line
+addition.
 
 ## Harnesses
 
@@ -104,9 +105,16 @@ scroll vertically.
 GitHub identifies whether the number is an issue or
 pull request. Issue workflows pin the fetched default-branch SHA and start one
 agent parent that owns implementation, review, CI, and an open pull request.
-Review workflows check out the exact pull-request head SHA and start a read-only
-review. The prompt is chosen per harness; Codex uses the Ponytail and Review
-Suite skills, opencode uses a harness-neutral review prompt.
+Pull-request workflows check out the exact pull-request head SHA and ask the
+agent to bring the existing pull request to a mergeable state: validate and sign
+off when it is already green and approved, or take over — rebase, resolve
+conflicts, fix failing checks, and address open review findings — when it is not.
+The controller injects a launch summary (mergeability, check counts, review
+decision) and the agent re-checks with the GitHub CLI. Missing required human
+review is reported as the remaining step rather than self-approved. A custom
+instruction such as "review only" keeps the agent strictly read-only. The prompt
+is chosen per harness; Codex uses the Ponytail and Review Suite skills, opencode
+uses a harness-neutral prompt.
 
 `feature-to-pr` uses the current repository. Its single multiline field accepts
 the feature or fix description. Enter starts the workflow; Shift+Enter adds a line.
@@ -130,7 +138,7 @@ becomes idle or done, its workspace is marked waiting. A blocked agent stays
 marked blocked for human input. In each case, the agent, the controller,
 worktree, and workspace stay available for follow-up. The controller checks
 again after follow-up activity settles. Once an implementation workflow has
-exactly one valid pull request, or a pull-request review completes, the
+exactly one valid pull request, or a pull-request workflow settles, the
 controller leaves the agent session and worktree available and exits. A detached
 watcher checks the associated PR once per minute and changes the workspace label
 to `✓ [I-3611] merged` (or the corresponding PR/task label) on merge. It does

@@ -2,7 +2,7 @@ id = "pimpmuckl.codex-workflows"
 name = "Codex Workflows"
 version = "0.1.0"
 min_herdr_version = "0.8.2"
-description = "Start feature work, issue fixes, and pull-request reviews in isolated workspaces for Codex, opencode, and other Herdr agents."
+description = "Start feature work and issue fixes, or shepherd existing pull requests to a mergeable state, in isolated workspaces for Codex, opencode, and other Herdr agents."
 platforms = ["windows"]
 
 [[actions]]
