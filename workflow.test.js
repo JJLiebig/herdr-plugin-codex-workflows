@@ -7,7 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {
-  autoCleanupOnPrMerge, canonicalRepositoryRoot, checksSummary, codexAgentStartArgs, completeGitHubTarget, confirmView, controllerProtocol, defaultHarnessKind, harnessStartArgs, installedIntegrations, openConfirmPopup, openInputPopup,
+  agentSessionTitle, autoCleanupOnPrMerge, canonicalRepositoryRoot, checksSummary, codexAgentStartArgs, completeGitHubTarget, confirmView, controllerProtocol, defaultHarnessKind, harnessStartArgs, installedIntegrations, openConfirmPopup, openInputPopup,
   project,
   implementationPullRequest, isAgentPromptStalled, monitor, openProgressPane, popupFields, popupInputKey, popupInputView, popupSelection, popupState, progressView, pullRequestReadiness, readPluginState, resolveRepository,
   sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands, trackedPullRequest, waitForActivity, writePluginState,
@@ -226,6 +226,37 @@ test("classifies pull-request checks and tracks the workflow pull request", () =
 
 test("pull-request identity uses the shepherding branch stem", () => {
   assert.match(makeIdentity("pr", { number: 7 }, "abcdef123456").branch, /^auto-pr-7-abcdef12-[0-9a-f]{6}$/);
+});
+
+test("cleans harness decoration from session titles", () => {
+  assert.equal(agentSessionTitle({ terminal_title_stripped: "OC | Flexible PR Review" }, getHarness("opencode")), "Flexible PR Review");
+  assert.equal(agentSessionTitle({ terminal_title_stripped: "Fix compact mode text scrolling | codex" }, getHarness("codex")), "Fix compact mode text scrolling");
+  assert.equal(agentSessionTitle({ terminal_title: "CX | Add retry" }, getHarness("codex")), "Add retry");
+  assert.equal(agentSessionTitle({ terminal_title_stripped: "Integrate tag, release, and build | destructive_command_g..." }, getHarness("codex")), "Integrate tag, release, and build");
+  assert.equal(agentSessionTitle({ terminal_title_stripped: "" }, getHarness("codex")), "");
+  assert.equal(agentSessionTitle({}, getHarness("codex")), "");
+  assert.equal([...agentSessionTitle({ terminal_title_stripped: "y".repeat(80) }, null)].length, 40);
+});
+
+test("project names the workspace and pane from the session title", () => {
+  const harness = getHarness("opencode");
+  const runtime = {
+    lifecycle: { state: "RUNNING" }, workflow: "task", harness,
+    identity: { agentName: "worker", shortLabel: "T-1e5f3b", branch: "auto-task-1e5f3b" },
+    worktree: { workspace: { workspace_id: "w1" }, root_pane: { pane_id: "w1:p1" } },
+  };
+  const agent = {
+    workspace_id: "w1", pane_id: "w1:p1", agent_status: "working",
+    agent_session: { source: "herdr:opencode", kind: "id", value: "ses_abc123def" },
+    terminal_title_stripped: "OC | Flexible PR Review",
+  };
+  const reports = [];
+  project(runtime, "working", "", { agent: () => agent, report: (args) => reports.push(args), save: () => {} });
+  const rename = reports.find((args) => args[0] === "workspace" && args[1] === "rename");
+  assert.equal(rename[3], "[Flexible PR Review] working");
+  const pane = reports.find((args) => args[0] === "pane" && args[1] === "report-metadata");
+  assert.equal(pane[pane.indexOf("--title") + 1], "Flexible PR Review parent");
+  assert.equal(runtime.label, "Flexible PR Review");
 });
 
 test("popup selects a harness with the arrow keys and type-ahead", () => {

@@ -144,6 +144,11 @@ watcher checks the associated PR once per minute and changes the workspace label
 to `✓ [I-3611] merged` (or the corresponding PR/task label) on merge. It does
 not stop or archive the agent, or remove the worktree. Closed, unmerged PRs do
 not get a merged indicator.
+Workspace labels start from the workflow identity (`I-3611`, `PR-42`,
+`T-<nonce>`) and switch to the harness session title once the agent reports one,
+so a freefield workflow reads like `[Fix compact mode text scrolling] working`
+instead of `[T-1e5f3b]`. The title is best-effort: harnesses that expose none keep
+the identity label, and the branch and worktree keep the stable `auto-…` name.
 Cleanup is manual by default. This applies to newly dispatched workflows;
 existing completed workspaces are not retroactively watched.
 

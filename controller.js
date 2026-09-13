@@ -395,23 +395,50 @@ function harnessKind(runtime) {
   return runtime.harness?.kind || DEFAULT_HARNESS;
 }
 
+const HARNESS_TITLE_TAGS = new Set(["codex", "opencode", "claude", "cursor", "copilot", "devin", "droid", "kimi", "kilo",
+  "mastracode", "omp", "pi", "qwen", "qoder", "qodercli", "grok", "hermes", "antigravity", "agy", "oc", "cx"]);
 
+function agentSessionTitle(agent, harness) {
+  const raw = compact(agent?.terminal_title_stripped || agent?.terminal_title || "");
+  if (!raw) return "";
+  const isTag = (part) => /^[A-Z0-9]{1,4}$/.test(part)
+    || part.toLowerCase() === (harness?.kind || "").toLowerCase()
+    || part.toLowerCase() === (harness?.label || "").toLowerCase()
+    || HARNESS_TITLE_TAGS.has(part.toLowerCase());
+  const parts = raw.split("|").map((part) => part.trim()).filter(Boolean);
+  while (parts.length > 1 && isTag(parts[0])) parts.shift();
+  // Codex appends the working-directory name after a pipe; a trailing token with
+  // no whitespace is decoration rather than part of the session title.
+  while (parts.length > 1 && (isTag(parts[parts.length - 1]) || !/\s/.test(parts[parts.length - 1]))) parts.pop();
+  const title = compact(parts.join(" | "));
+  return [...title].length > 40 ? `${[...title].slice(0, 39).join("")}…` : title;
+}
+
+function displayLabel(runtime, agent) {
+  if (!runtime.label) {
+    const title = agentSessionTitle(agent, runtime.harness);
+    if (title) runtime.label = title;
+  }
+  return runtime.label || runtime.identity.shortLabel;
+}
 
 function project(runtime, state = "working", reason = "", operations = {}) {
   const phase = state === "waiting" ? "waiting" : "working";
   const text = state === "blocked" ? "working · blocked" : phase;
   const workspaceId = runtime.worktree.workspace.workspace_id;
   const paneId = runtime.worktree.root_pane.pane_id;
+  let owner = null;
   try {
-    const owner = (operations.agent || getAgent)(runtime.identity.agentName);
+    owner = (operations.agent || getAgent)(runtime.identity.agentName);
     if (owner && !runtime.ownerSessionId) runtime.ownerSessionId = matchingSession([owner], workspaceId, paneId, runtime.harness).agent_session.value;
   } catch (error) {
     console.error(`session discovery pending: ${error.message}`);
   }
+  const label = displayLabel(runtime, owner);
   captureWorkflowIdentity(runtime, operations.save);
   try {
     const report = operations.report || runHerdr;
-    report(["workspace", "rename", workspaceId, `[${runtime.identity.shortLabel}] ${text}`]);
+    report(["workspace", "rename", workspaceId, `[${label}] ${text}`]);
     report([
       "workspace", "report-metadata", workspaceId, "--source", METADATA_SOURCE,
       "--token", `workflow_kind=${runtime.workflow}`,
@@ -425,7 +452,7 @@ function project(runtime, state = "working", reason = "", operations = {}) {
     ]);
     report([
       "pane", "report-metadata", paneId, "--source", METADATA_SOURCE,
-      "--display-agent", `${harnessLabel(runtime)} workflow`, "--title", `${runtime.identity.shortLabel} parent`,
+      "--display-agent", `${harnessLabel(runtime)} workflow`, "--title", `${label} parent`,
       "--state-label", `working=${text}`, "--state-label", `blocked=${compact(reason) || "needs input"}`,
       "--token", `workflow_phase=${phase}`,
     ]);
@@ -440,10 +467,11 @@ function projectTerminal(runtime, report, candidate = getAgent(runtime.identity.
   let owner = null;
   try { owner = candidate && matchingSession([candidate], workspaceId, paneId, runtime.harness); } catch {}
   if (owner && !runtime.ownerSessionId) runtime.ownerSessionId = owner.agent_session.value;
+  const label = displayLabel(runtime, candidate || owner);
   captureWorkflowIdentity(runtime);
   const resultText = report.status === "complete" ? (isImplementationWorkflow(runtime.workflow) ? "complete · PR open" : "complete") : report.status;
   try {
-    runHerdr(["workspace", "rename", workspaceId, `[${runtime.identity.shortLabel}] ${resultText}`]);
+    runHerdr(["workspace", "rename", workspaceId, `[${label}] ${resultText}`]);
     runHerdr([
       "workspace", "report-metadata", workspaceId, "--source", METADATA_SOURCE,
       "--token", `workflow_harness=${harnessKind(runtime)}`,
@@ -452,7 +480,7 @@ function projectTerminal(runtime, report, candidate = getAgent(runtime.identity.
       "--token", `workflow_phase=${resultText}`,
       ...(runtime.ownerSessionId ? ["--token", `workflow_root_pane=${paneId}`, "--token", `workflow_session=${runtime.ownerSessionId}`] : []),
     ]);
-    runHerdr(["pane", "rename", paneId, `${runtime.identity.shortLabel} ${harnessLabel(runtime)} parent`]);
+    runHerdr(["pane", "rename", paneId, `${label} ${harnessLabel(runtime)} parent`]);
   } catch (error) {
     console.error(`terminal metadata update failed: ${error.message}`);
   }
@@ -775,7 +803,7 @@ async function monitor(runtime, repository, operations = {}) {
       runtime.terminal = { type: "terminal", status: "cancelled", reason: "workflow workspace was closed" };
     }
     const agent = agentByName(runtime.identity.agentName);
-    if (!runtime.terminal && agent?.agent_session && !runtime.identitySaved) updateProject(runtime, lastProjection);
+    if (!runtime.terminal && agent?.agent_session && (!runtime.identitySaved || (!runtime.label && agentSessionTitle(agent, runtime.harness)))) updateProject(runtime, lastProjection);
     if (runtime.terminal) {
       runtime.lifecycle.transition("cancel");
       updateTerminal(runtime, runtime.terminal, agent);
@@ -1548,7 +1576,7 @@ async function main() {
   throw new Error("expected start, popup, progress, confirm, cleanup, or watch mode");
 }
 
-module.exports = { autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, configuredHarnesses, confirmView, controllerProtocol, defaultHarnessKind,
+module.exports = { agentSessionTitle, autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, configuredHarnesses, confirmView, controllerProtocol, defaultHarnessKind,
   harnessStartArgs, installedIntegrations, openConfirmPopup, openInputPopup, openProgressPane,
   popupFields, popupInputKey, popupInputView, popupSelection, popupState,
   project,
