@@ -52,13 +52,13 @@ last harness you pick is remembered and used as the next default.
 ## Install
 
 ```powershell
-herdr plugin install Pimpmuckl/herdr-plugin-codex-workflows
+herdr plugin install JJLiebig/herdr-plugin-codex-workflows
 ```
 
 For local development:
 
 ```powershell
-git clone https://github.com/Pimpmuckl/herdr-plugin-codex-workflows.git
+git clone https://github.com/JJLiebig/herdr-plugin-codex-workflows.git
 herdr plugin link .\herdr-plugin-codex-workflows
 ```
 
