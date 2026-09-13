@@ -262,6 +262,25 @@ test("project names the workspace and pane from the session title", () => {
   assert.equal(runtime.label, "Flexible PR Review");
 });
 
+test("issue and pull-request labels keep their workflow identity", () => {
+  const harness = getHarness("opencode");
+  const runtime = {
+    lifecycle: { state: "RUNNING" }, workflow: "issue", harness,
+    identity: { agentName: "worker", shortLabel: "I-3932", branch: "auto-issue-3932" },
+    worktree: { workspace: { workspace_id: "w13" }, root_pane: { pane_id: "w13:p1" } },
+  };
+  const agent = {
+    workspace_id: "w13", pane_id: "w13:p1", agent_status: "working",
+    agent_session: { source: "herdr:opencode", kind: "id", value: "ses_abc123def" },
+    terminal_title_stripped: "OC | Investigate Herdr Issue #3932",
+  };
+  const reports = [];
+  project(runtime, "working", "", { agent: () => agent, report: (args) => reports.push(args), save: () => {} });
+  const rename = reports.find((args) => args[0] === "workspace" && args[1] === "rename");
+  assert.equal(rename[3], "[I-3932] working");
+  assert.equal(runtime.label, undefined);
+});
+
 test("popup selects a harness with the arrow keys and type-ahead", () => {
   const state = popupState("github", harnessList(), "codex");
   assert.deepEqual(popupFields(state), ["harness", "target", "instructions"]);

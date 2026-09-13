@@ -420,6 +420,9 @@ function agentSessionTitle(agent, harness) {
 }
 
 function displayLabel(runtime, agent) {
+  // Only freefield workflows borrow the session title; issue and pull-request
+  // workflows keep their meaningful identity label.
+  if (runtime.workflow !== "task") return runtime.identity.shortLabel;
   const title = agentSessionTitle(agent, runtime.harness);
   if (title) runtime.label = title;
   return runtime.label || runtime.identity.shortLabel;
@@ -806,7 +809,7 @@ async function monitor(runtime, repository, operations = {}) {
       runtime.terminal = { type: "terminal", status: "cancelled", reason: "workflow workspace was closed" };
     }
     const agent = agentByName(runtime.identity.agentName);
-    const agentTitle = agent ? agentSessionTitle(agent, runtime.harness) : "";
+    const agentTitle = runtime.workflow === "task" && agent ? agentSessionTitle(agent, runtime.harness) : "";
     if (!runtime.terminal && agent?.agent_session && (!runtime.identitySaved || (agentTitle && agentTitle !== runtime.label))) updateProject(runtime, lastProjection);
     if (runtime.terminal) {
       runtime.lifecycle.transition("cancel");
