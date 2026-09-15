@@ -15,8 +15,8 @@ const {
   makePipeName, parseGitHubRemote, parseTarget, parseWorktreeList,
 } = require("./workflow.js");
 
-const PLUGIN_ID = "pimpmuckl.codex-workflows";
-const METADATA_SOURCE = "plugin:pimpmuckl.codex-workflows";
+const PLUGIN_ID = "jjliebig.codex-workflows";
+const METADATA_SOURCE = `plugin:${PLUGIN_ID}`;
 const herdr = process.env.HERDR_BIN_PATH || "herdr", gitBin = process.env.GIT_BIN_PATH || "git";
 const gh = process.env.GH_BIN_PATH || "gh";
 const CODE_ROOT = path.dirname(WORKTREE_ROOT);

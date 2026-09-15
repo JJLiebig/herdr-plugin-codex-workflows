@@ -78,19 +78,19 @@ Add the actions you want to Herdr's `config.toml`:
 [[keys.command]]
 key = "alt+i"
 type = "plugin_action"
-command = "pimpmuckl.codex-workflows.issue-to-pr"
+command = "jjliebig.codex-workflows.issue-to-pr"
 description = "issue or pull request"
 
 [[keys.command]]
 key = "alt+u"
 type = "plugin_action"
-command = "pimpmuckl.codex-workflows.feature-to-pr"
+command = "jjliebig.codex-workflows.feature-to-pr"
 description = "feature or fix"
 
 [[keys.command]]
 key = "alt+shift+d"
 type = "plugin_action"
-command = "pimpmuckl.codex-workflows.cleanup-current-workflow"
+command = "jjliebig.codex-workflows.cleanup-current-workflow"
 description = "clean up workflow"
 ```
 
@@ -156,7 +156,7 @@ Cleanup is manual by default. This applies to newly dispatched workflows;
 existing completed workspaces are not retroactively watched.
 
 To clean up automatically after the pull request merges, run
-`herdr plugin config-dir pimpmuckl.codex-workflows` and create `config.json` in
+`herdr plugin config-dir jjliebig.codex-workflows` and create `config.json` in
 that directory:
 
 ```json
