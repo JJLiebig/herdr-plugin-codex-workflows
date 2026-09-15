@@ -7,8 +7,8 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {
-  agentSessionTitle, autoCleanupOnPrMerge, canonicalRepositoryRoot, checksSummary, codexAgentStartArgs, completeGitHubTarget, confirmView, controllerProtocol, defaultHarnessKind, harnessStartArgs, installedIntegrations, openConfirmPopup, openInputPopup,
-  project,
+  agentMatchesHarness, agentSessionTitle, autoCleanupOnPrMerge, canonicalRepositoryRoot, checksSummary, codexAgentStartArgs, completeGitHubTarget, confirmView, controllerProtocol, defaultHarnessKind, harnessStartArgs, installedIntegrations, openConfirmPopup, openInputPopup,
+  project, startParentAgent,
   implementationPullRequest, isAgentPromptStalled, monitor, openProgressPane, popupFields, popupInputKey, popupInputView, popupSelection, popupState, progressView, pullRequestReadiness, readPluginState, resolveRepository,
   sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands, trackedPullRequest, waitForActivity, writePluginState,
 } = require("./controller.js");
@@ -522,6 +522,42 @@ test("forwards Codex++ auto-account only when the executable advertises it", () 
   assert.deepEqual(codexAgentStartArgs("worker", "w1:p2", () => "  --version  Print version"), base);
   assert.deepEqual(codexAgentStartArgs("worker", "w1:p2", () => "  --auto-accounting  Not the capability"), base);
   assert.deepEqual(codexAgentStartArgs("worker", "w1:p2", () => { throw new Error("probe failed"); }), base);
+});
+
+test("agent start timeouts adopt an already-running agent instead of failing", () => {
+  const runtime = { harness: getHarness("codex") };
+  const readHelp = () => "  --auto-account  Immediately select an account";
+  const startArgs = ["agent", "start", "worker", "--kind", "codex", "--pane", "w1:p2", "--", "--auto-account"];
+  const timeout = () => { const error = new Error("timed out waiting for agent startup"); error.herdrCode = "timeout"; return error; };
+
+  const adopted = [];
+  startParentAgent(runtime, "worker", "w1:p2",
+    (args) => { adopted.push(args); if (args[1] === "start") throw timeout(); },
+    () => ({ agent: "codex", agent_status: "working" }), readHelp);
+  assert.deepEqual(adopted, [startArgs, ["agent", "rename", "w1:p2", "worker"]]);
+
+  const started = [];
+  startParentAgent(runtime, "worker", "w1:p2",
+    (args) => started.push(args),
+    () => assert.fail("a successful start must not look up the pane"), readHelp);
+  assert.deepEqual(started, [startArgs]);
+
+  const fatal = new Error("busy"); fatal.herdrCode = "agent_pane_busy";
+  assert.throws(() => startParentAgent(runtime, "worker", "w1:p2",
+    () => { throw fatal; }, () => ({ agent: "codex" }), readHelp), /busy/);
+
+  assert.throws(() => startParentAgent(runtime, "worker", "w1:p2",
+    () => { throw timeout(); }, () => null, readHelp), /timed out/);
+  assert.throws(() => startParentAgent(runtime, "worker", "w1:p2",
+    () => { throw timeout(); }, () => ({ agent: "opencode" }), readHelp), /timed out/);
+});
+
+test("agent harness matching follows kind, label, and session source", () => {
+  assert.equal(agentMatchesHarness({ agent: "codex" }, getHarness("codex")), true);
+  assert.equal(agentMatchesHarness({ agent_session: { source: "herdr:codex" } }, getHarness("codex")), true);
+  assert.equal(agentMatchesHarness({ agent: "antigravity" }, getHarness("agy")), true);
+  assert.equal(agentMatchesHarness({ agent: "opencode" }, getHarness("codex")), false);
+  assert.equal(agentMatchesHarness(null, getHarness("codex")), false);
 });
 
 test("stalled prompts submit the pasted composer without repeating the prompt", () => {

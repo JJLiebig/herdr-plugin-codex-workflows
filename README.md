@@ -96,6 +96,14 @@ description = "clean up workflow"
 
 Then run `herdr server reload-config`.
 
+The plugin id is part of every binding, so existing bindings keep the id they
+were written with. Earlier builds shipped as `pimpmuckl.codex-workflows`; if
+your `config.toml` still uses that prefix, the keys resolve to nothing after
+the rename. Replace it with `jjliebig.codex-workflows` as shown above, then
+reload the config. Re-link the plugin once (`herdr plugin link .`) so Herdr's
+registry records the new id, and move any `plugins\config\pimpmuckl.codex-workflows`
+contents to `plugins\config\jjliebig.codex-workflows`.
+
 `issue-to-pr` accepts a complete issue or pull-request URL, partial link, or
 number. A complete GitHub URL selects its repository; the other forms use the
 current repository. Enter starts the workflow; Shift+Enter adds an instruction
@@ -133,7 +141,10 @@ RUNNING ->` a terminal result. Concurrent invocations do not share a queue or
 registry. The controller uses Herdr's native `agent start` and `agent prompt`
 lifecycle. When the canonical `codex` command advertises `--auto-account`, the
 controller forwards that startup option through Herdr; otherwise the launch is
-unchanged.
+unchanged. `agent start` waits for the agent to become interactive, which an
+already-busy agent never reports: if that wait times out while the requested
+agent is running in the pane, the controller re-adopts it under the workflow
+name instead of failing the launch.
 
 An implementation workflow with no pull request remains active. When the agent
 becomes idle or done, its workspace is marked waiting. A blocked agent stays

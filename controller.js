@@ -538,11 +538,39 @@ function promptOnce(agentName, prompt, onChild) {
   });
 }
 
+function agentMatchesHarness(agent, harness) {
+  if (!agent) return false;
+  if (agent.agent_session?.source === harness.source) return true;
+  const label = String(agent.agent || "").toLowerCase();
+  return label === harness.kind || label === harness.label.toLowerCase();
+}
+
+function startParentAgent(runtime, agentName, paneId, run = runHerdr, lookup = getAgent, readHelp) {
+  try {
+    run(harnessStartArgs(runtime.harness, agentName, paneId, readHelp));
+    return;
+  } catch (error) {
+    // `agent start` waits for interactive readiness. An agent that is already
+    // busy before the wait observes it — Codex++ selecting an account with
+    // --auto-account, or a prompt typed while startup is still settling — never
+    // reports idle, so the wait times out although the agent is running. When
+    // that agent is present in the pane, re-adopt it under the workflow name
+    // instead of failing the whole launch.
+    if (error.herdrCode !== "timeout") throw error;
+    if (!agentMatchesHarness(lookup(paneId), runtime.harness)) throw error;
+    try {
+      run(["agent", "rename", paneId, agentName]);
+    } catch {
+      throw error;
+    }
+  }
+}
+
 async function startParent(runtime, prompt) {
   const paneId = runtime.worktree.root_pane.pane_id;
   const agentName = runtime.identity.agentName;
   await waitForShell(paneId);
-  runHerdr(harnessStartArgs(runtime.harness, agentName, paneId));
+  startParentAgent(runtime, agentName, paneId);
   runtime.prompt = { child: null, finished: false, error: null };
   // Give a freshly detected agent time to finish bringing up its integrations.
   await delay(1000);
@@ -1612,10 +1640,10 @@ async function main() {
   throw new Error("expected start, popup, progress, confirm, cleanup, or watch mode");
 }
 
-module.exports = { agentSessionTitle, autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, configuredHarnesses, confirmView, controllerProtocol, defaultHarnessKind,
+module.exports = { agentMatchesHarness, agentSessionTitle, autoCleanupOnPrMerge, canonicalRepositoryRoot, codexAgentStartArgs, completeGitHubTarget, configuredHarnesses, confirmView, controllerProtocol, defaultHarnessKind,
   harnessStartArgs, installedIntegrations, openConfirmPopup, openInputPopup, openProgressPane,
   popupFields, popupInputKey, popupInputView, popupSelection, popupState,
-  project,
+  project, startParentAgent,
   checksSummary, implementationPullRequest, isAgentPromptStalled, monitor, progressView, pullRequestReadiness, readPluginConfig, readPluginState, resolveRepository, sourceDirectory, stalledPromptRecovery, stalledPromptRecoveryCommands,
   trackedPullRequest, waitForActivity, writePluginState };
 
