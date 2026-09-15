@@ -652,7 +652,7 @@ function cleanupOps(workspaceId, abandon, harness = getHarness(DEFAULT_HARNESS),
     git: async (cwd, args) => git(cwd, args),
     force,
     pullRequest: async (repo, number) => readJson(execute(gh, ["pr", "view", String(number), "--repo", repo, "--json", "state,mergedAt"])),
-    release: (workspaceId, paneId, sessionId, worktreePath) => releaseOwnedAgent(workspaceId, paneId, sessionId, worktreePath, harness),
+    release: (workspaceId, paneId, sessionId, worktreePath) => releaseOwnedAgent(workspaceId, paneId, sessionId, worktreePath, harness, true),
     archive: async (sessionId) => {
       if (harness.archiveArgs) runHarness(harness, harness.archiveArgs(sessionId));
     },
@@ -752,7 +752,7 @@ async function waitForAgentExit(paneId, timeout) {
   return !getAgent(paneId);
 }
 
-async function releaseOwnedAgent(workspaceId, paneId, sessionId, worktreePath, harness = getHarness(DEFAULT_HARNESS)) {
+async function releaseOwnedAgent(workspaceId, paneId, sessionId, worktreePath, harness = getHarness(DEFAULT_HARNESS), moveOut = false) {
   const agent = getAgent(paneId);
   if (agent) {
     matchingOwnedSession([agent], workspaceId, paneId, sessionId, harness);
@@ -767,9 +767,15 @@ async function releaseOwnedAgent(workspaceId, paneId, sessionId, worktreePath, h
     }
   }
   await waitForShell(paneId);
-  const outsideCwd = path.parse(path.resolve(worktreePath)).root;
-  runHerdr(["pane", "run", paneId, `cd ${outsideCwd}`]);
-  await waitForShell(paneId, outsideCwd);
+  if (moveOut) {
+    // A worktree cannot be removed while a live shell is sitting inside it, so
+    // cleanup moves the shell to the drive root and confirms the move before
+    // Herdr deletes the checkout. Controller-only releases leave the shell
+    // wherever the agent left it.
+    const outsideCwd = path.parse(path.resolve(worktreePath)).root;
+    runHerdr(["pane", "run", paneId, `cd ${outsideCwd}`]);
+    await waitForShell(paneId, outsideCwd);
+  }
 }
 
 async function requestControllerCleanup(owner) {
